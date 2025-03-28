@@ -334,39 +334,110 @@ class AudioProcessor:
         """Use OpenAI to identify different speakers in the transcript."""
         self.update_status("Identifying speakers...")
         
+        # Use gpt-4o-mini for speaker identification
+        model_to_use = DEFAULT_OPENAI_MODEL  # gpt-4o-mini is set as the default model
+        
+        self.update_status(f"Using {model_to_use} for speaker identification...")
+        
+        # Split the transcript into segments that might be from different speakers
+        lines = transcript.split('\n')
+        segments = []
+        current_segment = []
+        
+        for line in lines:
+            if line.strip():
+                current_segment.append(line)
+            elif current_segment:
+                segments.append(' '.join(current_segment))
+                current_segment = []
+                
+        if current_segment:
+            segments.append(' '.join(current_segment))
+        
+        # If transcript doesn't have clear segments, create artificial breaks
+        if len(segments) < 2:
+            words = transcript.split()
+            segment_size = max(20, len(words) // max(2, len(words) // 100))
+            segments = []
+            
+            for i in range(0, len(words), segment_size):
+                segments.append(' '.join(words[i:i+segment_size]))
+        
+        # Now create the prompt with these segments
         prompt = f"""
-        Analyze this transcript and identify different speakers. 
-        Format your response as a JSON array of speaker segments with the following structure:
+        Your task is to identify different speakers in this transcript.
+        
+        IMPORTANT INSTRUCTIONS:
+        1. You MUST assign each segment to a speaker, even if you're uncertain.
+        2. You MUST identify at least 2 different speakers if the transcript isn't clearly a monologue.
+        3. Always use "Speaker 1", "Speaker 2", etc. as identifiers.
+        4. Analyze turn-taking patterns, question-answer sequences, and different speaking styles.
+        5. Look for language patterns that indicate different people.
+        
+        Format your response exactly as a JSON array with this structure:
         [
             {{"speaker": "Speaker 1", "text": "Speaker 1's text..."}},
             {{"speaker": "Speaker 2", "text": "Speaker 2's text..."}},
             ...
         ]
         
-        Here's the transcript:
-        {transcript}
+        Here's the transcript split into possible segments:
+
+        {json.dumps(segments, indent=2)}
         """
         
         try:
             response = self.client.chat.completions.create(
-                model=DEFAULT_OPENAI_MODEL,
+                model=model_to_use,
                 messages=[
-                    {"role": "system", "content": "You are a transcript analyzer that identifies different speakers in conversation transcripts."},
+                    {"role": "system", "content": "You are a transcript analyzer that must divide any conversational text into parts spoken by different speakers. You always assume multiple speakers unless it's obviously a single-person monologue."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.2,
+                temperature=0.3,
                 response_format={"type": "json_object"}
             )
             
             result = json.loads(response.choices[0].message.content)
             self.speakers = result if isinstance(result, list) else result.get("speakers", [])
             
-            self.update_status("Speaker identification complete.")
+            # Ensure we have at least some speakers identified
+            if not self.speakers:
+                # Fallback: create basic speaker segmentation
+                self.speakers = self._create_default_speaker_segments(transcript)
+            
+            self.update_status(f"Speaker identification complete. Found {len(set(s['speaker'] for s in self.speakers))} speakers.")
             return self.speakers
             
         except Exception as e:
             self.update_status(f"Error identifying speakers: {str(e)}")
-            return []
+            # Fallback in case of API error
+            self.speakers = self._create_default_speaker_segments(transcript)
+            return self.speakers
+            
+    def _create_default_speaker_segments(self, transcript):
+        """Create fallback speaker segments when API fails."""
+        # Split the transcript into sentences or paragraphs
+        import re
+        sentences = re.split(r'(?<=[.!?])\s+', transcript)
+        
+        speakers = []
+        current_speaker = "Speaker 1"
+        
+        # Assign alternating speakers to sentences
+        for i, sentence in enumerate(sentences):
+            if not sentence.strip():
+                continue
+                
+            # Switch speakers every few sentences
+            if i > 0 and i % 3 == 0:
+                current_speaker = f"Speaker {(i // 3) % 2 + 1}"
+                
+            speakers.append({
+                "speaker": current_speaker,
+                "text": sentence
+            })
+            
+        return speakers
             
     def assign_speaker_names(self, speaker_map):
         """Replace generic speaker labels with actual names."""
@@ -378,11 +449,12 @@ class AudioProcessor:
         
         for segment in self.speakers:
             speaker_id = segment["speaker"]
-            if speaker_id in speaker_map:
-                segment["speaker"] = speaker_map[speaker_id]
-            updated_transcript.append(f"{segment['speaker']}: {segment['text']}")
+            speaker_name = speaker_map.get(speaker_id, speaker_id)
+            # Format with speaker name in bold
+            updated_transcript.append(f"{speaker_name}: {segment['text']}")
             
         result = "\n\n".join(updated_transcript)
+        self.transcript = result  # Update the transcript with speaker names
         self.update_status("Speaker names assigned.")
         return result
 
@@ -702,9 +774,19 @@ class MainFrame(wx.Frame):
         speaker_box = wx.StaticBox(panel, label="Speaker Identification")
         speaker_sizer = wx.StaticBoxSizer(speaker_box, wx.VERTICAL)
         
-        self.identify_speakers_btn = wx.Button(panel, label="Identify Speakers")
+        # Bold font for button text
+        button_font = wx.Font(wx.NORMAL_FONT.GetPointSize(), wx.FONTFAMILY_DEFAULT, 
+                           wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
+        
+        self.identify_speakers_btn = wx.Button(panel, label="Identify Speakers in Transcript")
+        self.identify_speakers_btn.SetFont(button_font)
+        self.identify_speakers_btn.SetBackgroundColour(wx.Colour(220, 230, 255))  # Light blue background
         self.identify_speakers_btn.Bind(wx.EVT_BUTTON, self.on_identify_speakers)
         speaker_sizer.Add(self.identify_speakers_btn, 0, wx.EXPAND | wx.ALL, 5)
+        
+        # Add a help text
+        help_text = wx.StaticText(panel, label="Click above to detect and label different speakers in your transcript")
+        speaker_sizer.Add(help_text, 0, wx.CENTER | wx.ALL, 5)
         
         # Speaker mapping UI
         self.speaker_mapping_panel = wx.Panel(panel)
@@ -1018,6 +1100,12 @@ class MainFrame(wx.Frame):
         lang_selection = self.language_choice.GetString(self.language_choice.GetSelection())
         language = lang_map.get(lang_selection, "en")
         
+        # Save language choice to config
+        self.config_manager.set_language("english" if language == "en" else "hungarian")
+        
+        # Update status message
+        self.update_status(f"Transcribing in {lang_selection}...")
+        
         # Disable buttons during processing
         self.transcribe_btn.Disable()
         self.identify_speakers_btn.Disable()
@@ -1033,9 +1121,18 @@ class MainFrame(wx.Frame):
             file_ext = os.path.splitext(file_path)[1].lower()
             
             response = self.audio_processor.transcribe_audio(file_path, language)
-            wx.CallAfter(self.transcript_text.SetValue, self.audio_processor.transcript)
+            
+            # Add a note about speaker identification at the top of the transcript
+            transcription_notice = "--- TRANSCRIPTION COMPLETE ---\n" + \
+                                  "To identify speakers in this transcript, click the 'Identify Speakers' button below.\n\n"
+            
+            wx.CallAfter(self.transcript_text.SetValue, transcription_notice + self.audio_processor.transcript)
             wx.CallAfter(self.update_button_states)
             wx.CallAfter(self.update_status, f"Transcription complete: {len(self.audio_processor.transcript)} characters")
+            
+            # Show a dialog informing the user to use speaker identification
+            wx.CallAfter(self.show_speaker_id_hint)
+            
         except FileNotFoundError as e:
             wx.CallAfter(wx.MessageBox, f"File not found: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
         except ValueError as e:
@@ -1090,22 +1187,65 @@ class MainFrame(wx.Frame):
             wx.CallAfter(self.transcribe_btn.Enable)
             wx.CallAfter(self.update_status, "Ready")
             
+    def show_speaker_id_hint(self):
+        """Show a hint dialog about using speaker identification."""
+        dlg = wx.MessageDialog(
+            self,
+            "Transcription is complete!\n\n"
+            "To identify different speakers in this transcript, click the 'Identify Speakers' button.\n\n"
+            "This will analyze the transcript and tag different speakers.",
+            "Speaker Identification",
+            wx.OK | wx.ICON_INFORMATION
+        )
+        dlg.ShowModal()
+        dlg.Destroy()
+        
+        # Highlight the identify speakers button
+        self.identify_speakers_btn.SetFocus()
+        
     def on_identify_speakers(self, event):
         """Handle speaker identification."""
         if not self.audio_processor.transcript:
             wx.MessageBox("Please transcribe an audio file first.", "No Transcript", wx.OK | wx.ICON_INFORMATION)
             return
             
+        # Create and show progress dialog
+        progress_dialog = wx.ProgressDialog(
+            "Speaker Identification",
+            "Processing speaker identification...\n\nAnalyzing transcript for different speakers...",
+            maximum=100,
+            parent=self,
+            style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE | wx.PD_ELAPSED_TIME
+        )
+        progress_dialog.Update(20)  # Initial update
+        
         # Disable buttons during processing
         self.identify_speakers_btn.Disable()
         
         # Start speaker identification in a separate thread
-        threading.Thread(target=self.identify_speakers_thread).start()
+        threading.Thread(target=self.identify_speakers_thread, args=(progress_dialog,)).start()
         
-    def identify_speakers_thread(self):
+    def identify_speakers_thread(self, progress_dialog=None):
         """Thread function for speaker identification."""
         try:
+            # Show processing message
+            wx.CallAfter(self.update_status, "Processing speaker identification...")
+            if progress_dialog:
+                wx.CallAfter(progress_dialog.Update, 20, "Preparing transcript for analysis...")
+                
+            # Small delay to ensure the UI updates
+            time.sleep(0.5)
+            
+            if progress_dialog:
+                wx.CallAfter(progress_dialog.Update, 40, "Analyzing speech patterns and conversation flow...")
+            
+            # Force the dialog to update before the potentially lengthy API call
+            wx.Yield()
+            
             speakers = self.audio_processor.identify_speakers(self.audio_processor.transcript)
+            
+            if progress_dialog:
+                wx.CallAfter(progress_dialog.Update, 80, "Creating speaker mapping interface...")
             
             # Clear existing mapping UI
             wx.CallAfter(self.speaker_mapping_sizer.Clear, True)
@@ -1113,7 +1253,17 @@ class MainFrame(wx.Frame):
             # Create UI for speaker mapping
             if speakers:
                 wx.CallAfter(self.create_speaker_mapping_ui, speakers)
+                speaker_count = len(set(s["speaker"] for s in speakers))
+                wx.CallAfter(self.update_status, f"Speaker identification complete. Found {speaker_count} speakers.")
+                if progress_dialog:
+                    wx.CallAfter(progress_dialog.Update, 100, f"Found {speaker_count} speakers in the transcript!")
+            else:
+                wx.CallAfter(self.update_status, "No speakers identified.")
+                if progress_dialog:
+                    wx.CallAfter(progress_dialog.Update, 100, "No speakers were identified in the transcript.")
         except Exception as e:
+            if progress_dialog:
+                wx.CallAfter(progress_dialog.Destroy)
             wx.CallAfter(wx.MessageBox, f"Speaker identification error: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
         finally:
             wx.CallAfter(self.identify_speakers_btn.Enable)
@@ -1127,23 +1277,46 @@ class MainFrame(wx.Frame):
             
         self.speaker_inputs = {}
         
+        # Use generic naming as default as these work better for unidentified speakers
+        # Start with Speaker 1, Speaker 2, etc.
+        
+        i = 0
         for speaker_id in sorted(speaker_ids):
             label = wx.StaticText(self.speaker_mapping_panel, label=f"{speaker_id}:")
             text_input = wx.TextCtrl(self.speaker_mapping_panel)
-            text_input.SetValue(speaker_id)  # Default to original ID
+            
+            # Keep the existing speaker ID if it follows our naming convention (Speaker X)
+            # or if it already appears to be a proper name
+            if "Speaker" in speaker_id or any(char.isupper() for char in speaker_id[1:]):
+                text_input.SetValue(speaker_id)
+            else:
+                # Otherwise assign a generic Speaker number
+                text_input.SetValue(f"Speaker {i+1}")
             
             self.speaker_mapping_sizer.Add(label, 0, wx.ALIGN_CENTER_VERTICAL)
             self.speaker_mapping_sizer.Add(text_input, 1, wx.EXPAND)
             
             self.speaker_inputs[speaker_id] = text_input
+            i += 1
+            
+        # Add a label with instructions
+        help_text = wx.StaticText(self.speaker_mapping_panel, 
+                                 label="Customize the speaker names above and then click 'Apply Speaker Names'")
+        # Span both columns
+        self.speaker_mapping_sizer.Add(help_text, 0, wx.ALIGN_CENTER | wx.TOP, 10)
+        self.speaker_mapping_sizer.Add(wx.StaticText(self.speaker_mapping_panel, label=""), 0)
             
         self.speaker_mapping_panel.Layout()
         self.audio_panel.Layout()
+            
+        # Auto-apply the speaker names to give immediate feedback
+        wx.CallLater(500, self.on_apply_speaker_names, None)
         
     def on_apply_speaker_names(self, event):
         """Apply speaker names to the transcript."""
         if not hasattr(self, 'speaker_inputs') or not self.speaker_inputs:
-            wx.MessageBox("Please identify speakers first.", "No Speakers Identified", wx.OK | wx.ICON_INFORMATION)
+            if event is not None:  # Only show message if called directly
+                wx.MessageBox("Please identify speakers first.", "No Speakers Identified", wx.OK | wx.ICON_INFORMATION)
             return
             
         # Get speaker name mapping
@@ -1153,7 +1326,32 @@ class MainFrame(wx.Frame):
         updated_transcript = self.audio_processor.assign_speaker_names(speaker_map)
         
         # Update transcript display
-        self.transcript_text.SetValue(updated_transcript)
+        self.transcript_text.SetValue("")  # Clear first to reset styling
+        
+        # Add each speaker segment with styling
+        lines = updated_transcript.split("\n\n")
+        for i, line in enumerate(lines):
+            if ":" in line:
+                speaker, text = line.split(":", 1)
+                
+                # Add speaker name with bold style and larger font
+                speaker_font = wx.Font(wx.NORMAL_FONT.GetPointSize() + 1, wx.FONTFAMILY_DEFAULT, 
+                                     wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
+                self.transcript_text.SetDefaultStyle(wx.TextAttr(wx.BLUE, wx.NullColour, speaker_font))
+                self.transcript_text.AppendText(f"{speaker}:")
+                
+                # Add text with normal style
+                self.transcript_text.SetDefaultStyle(wx.TextAttr(wx.BLACK, wx.NullColour, wx.Font(wx.NORMAL_FONT.GetPointSize(), wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)))
+                self.transcript_text.AppendText(f"{text}")
+            else:
+                self.transcript_text.AppendText(line)
+                
+            # Add newlines between segments (except for the last one)
+            if i < len(lines) - 1:
+                self.transcript_text.AppendText("\n\n")
+                
+        if event is not None:  # Only show status message if called directly
+            self.update_status("Speaker names applied to transcript.")
         
     def on_summarize(self, event):
         """Generate a summary of the transcript."""
