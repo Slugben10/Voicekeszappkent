@@ -340,31 +340,252 @@ class AudioProcessor:
         return self.identify_speakers_simple(transcript)
         
     def identify_speakers_simple(self, transcript):
-        """Identify speakers using a simpler, more reliable approach."""
+        """Identify speakers using a context-enhanced role-based approach."""
         self.update_status("Analyzing transcript for speaker identification...")
         
-        # Split transcript into sentences
+        # First, pre-analyze the transcript to understand speaker identities and roles
+        model_to_use = DEFAULT_OPENAI_MODEL
+        
+        # Step 1: Pre-analyze to find explicit speaker identities in the transcript
+        pre_analysis_prompt = f"""
+        Analyze this transcript and identify if there are any EXPLICIT mentions of speaker names or roles.
+        Examples: "My name is John", "This is Dr. Smith speaking", "As the interviewer, I'd like to ask...", etc.
+        
+        Return ONLY the names/roles you find with high confidence, with the exact quote that identifies them.
+        Format as JSON:
+        {{
+            "explicit_speakers": [
+                {{"name": "John", "role": "interviewee", "evidence": "My name is John and I'm here to discuss..."}},
+                {{"name": "Dr. Smith", "role": "expert", "evidence": "As Dr. Smith, I can tell you that..."}}
+            ]
+        }}
+        
+        If no explicit identities are found, return an empty array.
+        
+        Transcript:
+        {transcript}
+        """
+        
+        try:
+            # Get any explicit speaker identities first
+            explicit_identity_response = self.client.chat.completions.create(
+                model=model_to_use,
+                messages=[
+                    {"role": "system", "content": "You are an expert at identifying explicit speaker identities in transcripts."},
+                    {"role": "user", "content": pre_analysis_prompt}
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
+            
+            identity_data = json.loads(explicit_identity_response.choices[0].message.content)
+            explicit_speakers = identity_data.get("explicit_speakers", [])
+            
+            # Step 2: Perform comprehensive role analysis
+            role_analysis_prompt = f"""
+            Analyze this transcript and determine the conversation structure and speaker roles.
+            
+            Conversation Analysis:
+            1. What type of conversation is this? (interview, consultation, lecture, debate, casual conversation)
+            2. How many distinct speakers are there? (must be exactly 2)
+            3. What's the relationship dynamic? (expert/novice, interviewer/interviewee, colleagues, friends)
+            
+            For each speaker, analyze:
+            - Linguistic patterns (formal/informal, technical/casual language, sentence length)
+            - Question patterns (who asks more questions? what types of questions?)
+            - Topic knowledge (who demonstrates more expertise on topics discussed?)
+            - Speech patterns (hesitations, fillers, interruptions)
+            
+            Explicit identities found: {json.dumps(explicit_speakers)}
+            
+            Format your response as:
+            {{
+                "conversation_type": "type",
+                "relationship_dynamic": "primary dynamic",
+                "speaker_a": {{
+                    "role": "primary role",
+                    "name": "name if found in explicit_speakers, otherwise 'Speaker A'",
+                    "characteristics": ["uses technical terms", "asks clarifying questions", etc],
+                    "speech_patterns": ["short sentences", "formal language", etc],
+                    "knowledge_areas": ["shows expertise in X", "familiar with Y"],
+                    "question_style": "description of questioning style"
+                }},
+                "speaker_b": {{
+                    "role": "primary role",
+                    "name": "name if found in explicit_speakers, otherwise 'Speaker B'",
+                    "characteristics": ["uses casual language", "shares personal stories", etc],
+                    "speech_patterns": ["long explanations", "uses analogies", etc],
+                    "knowledge_areas": ["knowledgeable about Z", "asks about W"],
+                    "question_style": "description of questioning style"
+                }}
+            }}
+            
+            Transcript:
+            {transcript}
+            """
+            
+            # Get detailed role analysis
+            role_response = self.client.chat.completions.create(
+                model=model_to_use,
+                messages=[
+                    {"role": "system", "content": "You are an expert conversation analyst who can identify speaker roles and communication patterns in transcripts."},
+                    {"role": "user", "content": role_analysis_prompt}
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
+            
+            role_analysis = json.loads(role_response.choices[0].message.content)
+            
+            # Split transcript into paragraphs for speaker assignment
+            paragraphs = self._create_improved_paragraphs(transcript)
+            
+            # Step 3: Assign speakers with context awareness
+            speaker_assignment_prompt = f"""
+            You are analyzing a conversation between two speakers with the following profiles:
+            
+            Speaker A: {json.dumps(role_analysis.get('speaker_a', {}), indent=2)}
+            
+            Speaker B: {json.dumps(role_analysis.get('speaker_b', {}), indent=2)}
+            
+            Conversation type: {role_analysis.get('conversation_type', 'conversation')}
+            Relationship: {role_analysis.get('relationship_dynamic', 'two speakers')}
+            
+            ASSIGNMENT RULES:
+            1. Each paragraph must be assigned to EXACTLY ONE speaker (A or B)
+            2. Questions are typically answered by the OTHER speaker
+            3. First-person statements must be consistent (e.g., "I believe" statements from same speaker)
+            4. Personal experiences must be attributed consistently
+            5. Technical explanations typically come from the expert/knowledgeable role
+            6. Look for linguistic patterns that match each speaker's profile
+            7. The conversation should flow naturally with back-and-forth exchanges
+            
+            Here are the paragraphs to analyze:
+            {json.dumps([{"id": i, "text": p} for i, p in enumerate(paragraphs)], indent=2)}
+            
+            For each paragraph, determine:
+            1. Which speaker's language patterns it matches
+            2. Whether it's a question or response to previous content
+            3. Whether it continues a previous thought or starts a new one
+            4. How it fits into the conversation flow
+            
+            Format your response EXACTLY as follows:
+            [
+                {{
+                    "id": 0,
+                    "speaker": "A or B",
+                    "text": "paragraph text",
+                    "reasoning": "brief explanation of assignment decision"
+                }}
+            ]
+            """
+            
+            # Assign speakers to paragraphs
+            assignment_response = self.client.chat.completions.create(
+                model=model_to_use,
+                messages=[
+                    {"role": "system", "content": "You are an expert conversation analyst who identifies speaker turns in transcripts with high accuracy."},
+                    {"role": "user", "content": speaker_assignment_prompt}
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
+            
+            assignments = json.loads(assignment_response.choices[0].message.content)
+            
+            # Process the results
+            if isinstance(assignments, dict) and "paragraphs" in assignments:
+                assignments = assignments["paragraphs"]
+            elif not isinstance(assignments, list):
+                # Try to extract a list if nested
+                for key, value in assignments.items():
+                    if isinstance(value, list) and len(value) > 0:
+                        assignments = value
+                        break
+            
+            # Map Speaker A/B to Speaker 1/2 for compatibility with existing system
+            speaker_map = {
+                "A": "Speaker 1", 
+                "B": "Speaker 2",
+                "Speaker A": "Speaker 1", 
+                "Speaker B": "Speaker 2"
+            }
+            
+            # Create speakers list with proper mapping
+            self.speakers = []
+            for item in sorted(assignments, key=lambda x: x.get("id", 0)):
+                speaker_label = item.get("speaker", "Unknown")
+                # Map "A" -> "Speaker 1" and "B" -> "Speaker 2"
+                mapped_speaker = speaker_map.get(speaker_label, speaker_label)
+                
+                self.speakers.append({
+                    "speaker": mapped_speaker,
+                    "text": item.get("text", ""),
+                    "reasoning": item.get("reasoning", "")
+                })
+            
+            # Ensure we have the right number of paragraphs
+            if len(self.speakers) != len(paragraphs):
+                self.update_status(f"Warning: Received {len(self.speakers)} segments but expected {len(paragraphs)}. Fixing...")
+                self.speakers = [
+                    {"speaker": self.speakers[min(i, len(self.speakers)-1)]["speaker"] if self.speakers else f"Speaker {i % 2 + 1}", 
+                     "text": p}
+                    for i, p in enumerate(paragraphs)
+                ]
+            
+            # Store the speaker segments for future reference
+            self.speaker_segments = paragraphs
+            
+            # Apply enhanced role-based fixes
+            self._apply_enhanced_role_fixes(role_analysis)
+            
+            # Apply deep consistency check
+            self._apply_deep_consistency_check(role_analysis)
+            
+            self.update_status(f"Speaker identification complete using context-enhanced analysis.")
+            return self.speakers
+            
+        except Exception as e:
+            self.update_status(f"Error in speaker identification: {str(e)}")
+            # Fallback to basic alternating speaker assignment
+            paragraphs = self._create_improved_paragraphs(transcript)
+            self.speakers = [
+                {"speaker": f"Speaker {i % 2 + 1}", "text": p}
+                for i, p in enumerate(paragraphs)
+            ]
+            self.speaker_segments = paragraphs
+            return self.speakers
+    
+    def _create_improved_paragraphs(self, transcript):
+        """Create more intelligent paragraph breaks based on semantic analysis."""
         import re
+        # Split transcript into sentences
         sentences = re.split(r'(?<=[.!?])\s+', transcript.strip())
         sentences = [s.strip() for s in sentences if s.strip()]
         
-        # Group sentences into paragraphs with more intelligent grouping
+        # Group sentences into paragraphs
         paragraphs = []
         current_para = []
         
-        # List of phrases that often indicate the beginning of a new speaker's turn
+        # These phrases often signal the start of a new speaker's turn
         new_speaker_indicators = [
             "yes", "no", "I think", "I believe", "so,", "well,", "actually", 
             "to be honest", "in my opinion", "I agree", "I disagree",
             "let me", "I'd like to", "I would", "you know", "um", "uh", 
-            "hmm", "but", "however", "from my perspective", "wait", "okay"
+            "hmm", "but", "however", "from my perspective", "wait", "okay",
+            "right", "sure", "exactly", "absolutely", "definitely", "perhaps",
+            "look", "listen", "basically", "frankly", "honestly", "now", "so",
+            "thank you", "thanks", "good point", "interesting", "true", "correct",
+            "first of all", "firstly", "secondly", "finally", "in conclusion"
         ]
         
-        # Words that often indicate continuation of the same speaker
+        # Words/phrases that indicate continuation by the same speaker
         continuation_indicators = [
             "and", "also", "additionally", "moreover", "furthermore", "plus",
             "then", "after that", "next", "finally", "lastly", "in addition",
-            "consequently", "as a result", "therefore", "thus"
+            "consequently", "as a result", "therefore", "thus", "besides",
+            "for example", "specifically", "in particular", "especially",
+            "because", "since", "due to", "as such", "which means"
         ]
         
         for i, sentence in enumerate(sentences):
@@ -379,14 +600,19 @@ class AudioProcessor:
             elif i > 0 and sentences[i-1].endswith('?'):
                 start_new_para = True
                 
-            # 3. Current sentence begins with a common "new speaker" phrase
-            elif any(sentence.lower().startswith(indicator) for indicator in new_speaker_indicators):
+            # 3. Current sentence begins with a common new speaker phrase
+            elif any(sentence.lower().startswith(indicator.lower()) for indicator in new_speaker_indicators):
                 start_new_para = True
                 
-            # 4. This doesn't seem to be a continuation of the previous thought
+            # 4. Not a continuation and not a pronoun reference
             elif (i > 0 and 
-                  not any(sentence.lower().startswith(indicator) for indicator in continuation_indicators) and
+                  not any(sentence.lower().startswith(indicator.lower()) for indicator in continuation_indicators) and
+                  not re.match(r'^(It|This|That|These|Those|They|He|She|We|I)\b', sentence, re.IGNORECASE) and
                   len(current_para) >= 2):
+                start_new_para = True
+                
+            # 5. Natural length limit to avoid overly long paragraphs
+            elif len(current_para) >= 4:
                 start_new_para = True
             
             # Start a new paragraph if needed
@@ -394,165 +620,138 @@ class AudioProcessor:
                 paragraphs.append(' '.join(current_para))
                 current_para = []
             
-            # Add the current sentence to the paragraph
             current_para.append(sentence)
         
-        # Add the last paragraph if not empty
+        # Add the last paragraph
         if current_para:
             paragraphs.append(' '.join(current_para))
         
-        # Now use the LLM to identify speakers for complete paragraphs
-        model_to_use = DEFAULT_OPENAI_MODEL
+        return paragraphs
         
-        prompt = f"""
-        Your task is to identify speakers in this transcript.
-        
-        IMPORTANT INSTRUCTIONS:
-        1. Each item in the list is a complete paragraph from a single speaker.
-        2. You MUST assign each paragraph to exactly ONE speaker.
-        3. You MUST identify exactly 2 different speakers in this conversation.
-        4. Always use "Speaker 1" and "Speaker 2" as identifiers.
-        5. Questions are ALWAYS followed by answers from the OTHER speaker.
-        6. Maintain a logical conversation flow.
-        7. Pay attention to language patterns that indicate different speakers.
-        8. When in doubt about who's speaking, consider:
-           - Questions should be answered by the other speaker
-           - Contradictions or different viewpoints suggest different speakers
-           - Similar ideas or explanation continuations suggest the same speaker
-        
-        Format your response exactly as a JSON array with this structure:
-        [
-            {{"speaker": "Speaker 1", "text": "Text of paragraph 1"}},
-            {{"speaker": "Speaker 2", "text": "Text of paragraph 2"}},
-            ...
-        ]
-        
-        Here are the paragraphs to analyze:
-
-        {json.dumps([{"paragraph_id": i, "text": p} for i, p in enumerate(paragraphs)], indent=2)}
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=model_to_use,
-                messages=[
-                    {"role": "system", "content": "You are a transcript analyzer specializing in two-person conversations. Your task is to identify which speaker said each paragraph in the transcript. You're extremely good at recognizing when the speaker changes based on content, tone, and conversation flow. You understand that questions are typically asked by one person and answered by another."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.0,  # Use 0 temperature for maximum consistency
-                response_format={"type": "json_object"}
-            )
-            
-            result = json.loads(response.choices[0].message.content)
-            segments = result if isinstance(result, list) else result.get("speakers", [])
-            
-            # If we don't get proper segments, try to extract them from the response
-            if not segments:
-                try:
-                    # Sometimes the API returns {"paragraphs": [...]} instead
-                    segments = result.get("paragraphs", [])
-                except:
-                    pass
-            
-            # Store the results
-            self.speakers = []
-            
-            # Set up alternating speakers if we failed to get segments
-            if not segments and paragraphs:
-                self.speakers = [
-                    {"speaker": f"Speaker {i % 2 + 1}", "text": p}
-                    for i, p in enumerate(paragraphs)
-                ]
-            else:
-                self.speakers = segments
-            
-            # Handle case where segments don't match paragraphs
-            if len(self.speakers) != len(paragraphs):
-                self.update_status(f"Warning: Received {len(self.speakers)} segments but expected {len(paragraphs)}. Fixing...")
-                self.speakers = [
-                    {"speaker": segments[min(i, len(segments)-1)]["speaker"] if segments else f"Speaker {i % 2 + 1}", 
-                     "text": p}
-                    for i, p in enumerate(paragraphs)
-                ]
-            
-            # Ensure we have at least 2 speakers
-            speakers_set = set(s["speaker"] for s in self.speakers)
-            if len(speakers_set) < 2:
-                # Force alternating speakers
-                for i in range(len(self.speakers)):
-                    self.speakers[i]["speaker"] = f"Speaker {i % 2 + 1}"
-            
-            # Store the speaker segments for future reference
-            self.speaker_segments = paragraphs
-            
-            # Apply enhanced post-processing
-            self._apply_enhanced_speaker_logic()
-            
-            self.update_status(f"Speaker identification complete. Found {len(set(s['speaker'] for s in self.speakers))} speakers.")
-            return self.speakers
-            
-        except Exception as e:
-            self.update_status(f"Error in speaker identification: {str(e)}")
-            # Fallback to basic alternating speaker assignment
-            self.speakers = [
-                {"speaker": f"Speaker {i % 2 + 1}", "text": p}
-                for i, p in enumerate(paragraphs)
-            ]
-            self.speaker_segments = paragraphs
-            return self.speakers
-            
-    def _apply_enhanced_speaker_logic(self):
-        """Apply enhanced conversation logic to improve speaker assignment."""
-        if len(self.speakers) < 2:
+    def _apply_enhanced_role_fixes(self, role_analysis):
+        """Apply enhanced fixes based on speaker roles and conversation analysis."""
+        if len(self.speakers) < 3:
             return
-            
-        # Get unique speakers
-        unique_speakers = list(set(s["speaker"] for s in self.speakers))
-        if len(unique_speakers) < 2:
-            return
-            
-        # 1. Apply question-answer rule (strictest rule)
+        
+        # Extract data from role analysis
+        speaker_a_data = role_analysis.get('speaker_a', {})
+        speaker_b_data = role_analysis.get('speaker_b', {})
+        
+        # Map Speaker A/B to Speaker 1/2
+        speaker_map = {"A": "Speaker 1", "B": "Speaker 2", "Speaker A": "Speaker 1", "Speaker B": "Speaker 2"}
+        speaker_a_id = speaker_map.get("A", "Speaker 1")
+        speaker_b_id = speaker_map.get("B", "Speaker 2")
+        
+        # 1. Question-Answer Enforcement
         for i in range(len(self.speakers) - 1):
             current = self.speakers[i]
             next_segment = self.speakers[i + 1]
             
-            # If the current segment contains a question
+            # If current segment contains a question, the next should be from different speaker
             if '?' in current["text"]:
-                # Make sure the next segment is from a different speaker
                 if current["speaker"] == next_segment["speaker"]:
-                    # Find the other speaker
-                    other_speaker = [s for s in unique_speakers if s != current["speaker"]][0]
-                    next_segment["speaker"] = other_speaker
+                    next_segment["speaker"] = speaker_b_id if current["speaker"] == speaker_a_id else speaker_a_id
         
-        # 2. Look for clear speaker indicators in text
-        speaker_indicators = {
-            "I think": None,  # will be filled with actual speakers
-            "In my opinion": None,
-            "I believe": None,
-            "I agree": None,
-            "I disagree": None,
-            "From my perspective": None
+        # 2. Look for role-specific content markers
+        for i, segment in enumerate(self.speakers):
+            text = segment["text"].lower()
+            
+            # Expert knowledge indicators
+            if speaker_a_data.get("role") in ["expert", "teacher", "consultant"]:
+                knowledge_areas = speaker_a_data.get("knowledge_areas", [])
+                for area in knowledge_areas:
+                    if isinstance(area, str) and area.lower() in text:
+                        segment["speaker"] = speaker_a_id
+                        break
+                        
+            if speaker_b_data.get("role") in ["expert", "teacher", "consultant"]:
+                knowledge_areas = speaker_b_data.get("knowledge_areas", [])
+                for area in knowledge_areas:
+                    if isinstance(area, str) and area.lower() in text:
+                        segment["speaker"] = speaker_b_id
+                        break
+        
+        # 3. Look for speech pattern matches
+        for i, segment in enumerate(self.speakers):
+            text = segment["text"].lower()
+            
+            # Speaker A speech patterns
+            speech_patterns = speaker_a_data.get("speech_patterns", [])
+            for pattern in speech_patterns:
+                if isinstance(pattern, str) and len(pattern) > 5 and pattern.lower() in text:
+                    segment["speaker"] = speaker_a_id
+                    break
+                    
+            # Speaker B speech patterns
+            speech_patterns = speaker_b_data.get("speech_patterns", [])
+            for pattern in speech_patterns:
+                if isinstance(pattern, str) and len(pattern) > 5 and pattern.lower() in text:
+                    segment["speaker"] = speaker_b_id
+                    break
+                    
+        # 4. Ensure conversation flow (avoid unrealistically long monologues)
+        max_consecutive = 3  # Maximum consecutive paragraphs by same speaker
+        current_speaker = None
+        consecutive_count = 0
+        
+        for i, segment in enumerate(self.speakers):
+            if segment["speaker"] == current_speaker:
+                consecutive_count += 1
+                # If too many consecutive segments, alternate speakers
+                if consecutive_count > max_consecutive and i < len(self.speakers) - 1:
+                    # Only change if the next segment doesn't contain clearly personal information
+                    next_text = self.speakers[i + 1]["text"].lower()
+                    if not re.search(r'\bI\b|\bmy\b|\bmine\b|\bmyself\b', next_text):
+                        next_speaker = speaker_b_id if current_speaker == speaker_a_id else speaker_a_id
+                        self.speakers[i + 1]["speaker"] = next_speaker
+                        current_speaker = next_speaker
+                        consecutive_count = 1
+            else:
+                current_speaker = segment["speaker"]
+                consecutive_count = 1
+        
+    def _apply_deep_consistency_check(self, role_analysis):
+        """Perform deep consistency check to ensure speaker identity integrity."""
+        if len(self.speakers) < 3:
+            return
+            
+        # Create category maps for different types of first-person statements
+        identity_categories = {
+            "personal_beliefs": {"speaker": None, "regex": r'\bI (?:think|believe|feel|consider|assume|suppose)\b|\bin my (?:opinion|view|estimation|judgment)\b'},
+            "personal_experiences": {"speaker": None, "regex": r'\bI (?:have|had|went|experienced|saw|heard|did|tried)\b|\bmy (?:experience|background|history|life|past)\b'},
+            "personal_actions": {"speaker": None, "regex": r'\bI (?:will|would|could|can|am going to|plan to|want to|need to)\b'},
+            "personal_preferences": {"speaker": None, "regex": r'\bI (?:like|love|enjoy|prefer|dislike|hate)\b|\bmy (?:favorite|preference)\b'},
+            "self_references": {"speaker": None, "regex": r'\bmy (?:name|role|job|position|company|organization)\b|\bI am (?:a|an|the) (?:[a-z]+ist|[a-z]+er|expert|professional|specialist|consultant)\b'}
         }
         
-        # First pass - identify phrases with consistent speakers
-        for segment in self.speakers:
-            for phrase in speaker_indicators.keys():
-                if phrase.lower() in segment["text"].lower():
-                    # If this is the first time we've seen this phrase
-                    if speaker_indicators[phrase] is None:
-                        speaker_indicators[phrase] = segment["speaker"]
-                    # Otherwise, consistency check - if inconsistent, mark as unusable
-                    elif speaker_indicators[phrase] != segment["speaker"]:
-                        speaker_indicators[phrase] = "inconsistent"
+        # Speaker A/B to Speaker 1/2 mapping
+        speaker_map = {"A": "Speaker 1", "B": "Speaker 2", "Speaker A": "Speaker 1", "Speaker B": "Speaker 2"}
         
-        # Second pass - apply consistent indicators to fix assignments
-        for i, segment in enumerate(self.speakers):
-            for phrase, speaker in speaker_indicators.items():
-                if (speaker not in [None, "inconsistent"] and 
-                    phrase.lower() in segment["text"].lower() and
-                    segment["speaker"] != speaker):
-                    # Found an inconsistency - fix it
-                    segment["speaker"] = speaker
+        # First pass: identify consistent patterns for each category
+        for segment in self.speakers:
+            text = segment["text"].lower()
+            speaker = segment["speaker"]
+            
+            for category, data in identity_categories.items():
+                if re.search(data["regex"], text):
+                    if data["speaker"] is None:
+                        # First occurrence of this category
+                        data["speaker"] = speaker
+        
+        # Second pass: fix inconsistencies
+        fixed_count = 0
+        for segment in self.speakers:
+            text = segment["text"].lower()
+            speaker = segment["speaker"]
+            
+            for category, data in identity_categories.items():
+                if data["speaker"] is not None and re.search(data["regex"], text) and speaker != data["speaker"]:
+                    # Inconsistency found - fix it
+                    segment["speaker"] = data["speaker"]
+                    fixed_count += 1
+        
+        if fixed_count > 0:
+            self.update_status(f"Deep consistency check: fixed {fixed_count} speaker attribution issues")
 
     def assign_speaker_names(self, speaker_map):
         """Replace generic speaker labels with actual names."""
