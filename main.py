@@ -27,7 +27,7 @@ except ImportError:
 # Ensure required directories exist
 def ensure_directories():
     """Create necessary directories if they don't exist."""
-    directories = ["Documents", "Transcripts", "Summaries"]
+    directories = ["Transcripts", "Summaries"]
     for directory in directories:
         if not os.path.exists(directory):
             os.makedirs(directory)
@@ -458,81 +458,6 @@ class AudioProcessor:
         self.update_status("Speaker names assigned.")
         return result
 
-# Document Manager Class
-class DocumentManager:
-    def __init__(self, update_callback=None):
-        self.update_callback = update_callback
-        self.document_dir = "Documents"
-        self.selected_documents = []
-        self.document_cache = {}  # Cache document contents
-        
-    def update_status(self, message):
-        if self.update_callback:
-            wx.CallAfter(self.update_callback, message)
-            
-    def get_document_list(self):
-        """Get list of available documents."""
-        if not os.path.exists(self.document_dir):
-            os.makedirs(self.document_dir)
-        return sorted([f for f in os.listdir(self.document_dir) if os.path.isfile(os.path.join(self.document_dir, f))])
-        
-    def add_document(self, source_path):
-        """Add a document to the documents directory."""
-        filename = os.path.basename(source_path)
-        destination = os.path.join(self.document_dir, filename)
-        
-        # Check if a file with the same name already exists
-        if os.path.exists(destination):
-            counter = 1
-            name, ext = os.path.splitext(filename)
-            while os.path.exists(os.path.join(self.document_dir, f"{name}_{counter}{ext}")):
-                counter += 1
-            destination = os.path.join(self.document_dir, f"{name}_{counter}{ext}")
-                
-        try:
-            shutil.copy2(source_path, destination)
-            self.update_status(f"Document added: {os.path.basename(destination)}")
-            return os.path.basename(destination)
-        except Exception as e:
-            self.update_status(f"Error adding document: {str(e)}")
-            return None
-            
-    def select_documents(self, filenames):
-        """Select documents to be used in the LLM context."""
-        self.selected_documents = [os.path.join(self.document_dir, f) for f in filenames]
-        self.update_status(f"Selected {len(self.selected_documents)} documents.")
-        
-    def get_document_content(self, filename):
-        """Get the content of a document, using cache if available."""
-        full_path = os.path.join(self.document_dir, filename)
-        
-        if full_path in self.document_cache:
-            return self.document_cache[full_path]
-            
-        try:
-            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read()
-                self.document_cache[full_path] = content
-                return content
-        except Exception as e:
-            self.update_status(f"Error reading document {filename}: {str(e)}")
-            return ""
-            
-    def get_selected_documents_content(self):
-        """Get the content of all selected documents."""
-        content = []
-        for doc_path in self.selected_documents:
-            doc_name = os.path.basename(doc_path)
-            doc_content = self.get_document_content(doc_name)
-            if doc_content:
-                content.append(f"Document: {doc_name}\n\n{doc_content}\n\n")
-        return "\n".join(content)
-        
-    def clear_selection(self):
-        """Clear the document selection."""
-        self.selected_documents = []
-        self.update_status("Document selection cleared.")
-
 # LLM Processing Class
 class LLMProcessor:
     def __init__(self, client, config_manager, update_callback=None):
@@ -545,13 +470,13 @@ class LLMProcessor:
         if self.update_callback:
             wx.CallAfter(self.update_callback, message)
             
-    def generate_response(self, prompt, context=None, temperature=None):
+    def generate_response(self, prompt, temperature=None):
         """Generate a response from the LLM."""
         if temperature is None:
             temperature = self.config_manager.get_temperature()
             
         model = self.config_manager.get_model()
-        messages = self.prepare_messages(prompt, context)
+        messages = self.prepare_messages(prompt)
         
         try:
             self.update_status("Generating response...")
@@ -574,15 +499,12 @@ class LLMProcessor:
             self.update_status(f"Error generating response: {str(e)}")
             return f"Error: {str(e)}"
             
-    def prepare_messages(self, prompt, context=None):
-        """Prepare messages for the LLM, including context and chat history."""
+    def prepare_messages(self, prompt):
+        """Prepare messages for the LLM, including chat history."""
         messages = []
         
         # Add system message
-        system_content = "You are a helpful assistant that can analyze documents and transcripts."
-        if context:
-            system_content += " Here is some context you should use to inform your responses:\n\n" + context
-            
+        system_content = "You are a helpful assistant that can analyze transcripts."
         messages.append({"role": "system", "content": system_content})
         
         # Add chat history (limit to last 10 messages to avoid token limits)
@@ -655,7 +577,6 @@ class MainFrame(wx.Frame):
         
         # Initialize processors
         self.audio_processor = AudioProcessor(client, self.update_status)
-        self.document_manager = DocumentManager(self.update_status)
         self.llm_processor = LLMProcessor(client, self.config_manager, self.update_status)
         
         # Set up the UI
@@ -700,19 +621,16 @@ class MainFrame(wx.Frame):
         
         # Create panels for each tab
         self.audio_panel = wx.Panel(self.notebook)
-        self.document_panel = wx.Panel(self.notebook)
         self.chat_panel = wx.Panel(self.notebook)
         self.settings_panel = wx.Panel(self.notebook)
         
         # Add panels to notebook
         self.notebook.AddPage(self.audio_panel, "Audio Processing")
-        self.notebook.AddPage(self.document_panel, "Document Management")
         self.notebook.AddPage(self.chat_panel, "Chat")
         self.notebook.AddPage(self.settings_panel, "Settings")
         
         # Create UI for each panel
         self.create_audio_panel()
-        self.create_document_panel()
         self.create_chat_panel()
         self.create_settings_panel()
         
@@ -828,68 +746,6 @@ class MainFrame(wx.Frame):
         
         # Initial button states
         self.update_button_states()
-        
-    def create_document_panel(self):
-        """Create the document management panel."""
-        panel = self.document_panel
-        sizer = wx.BoxSizer(wx.VERTICAL)
-        
-        # Document upload section
-        upload_box = wx.StaticBox(panel, label="Upload Document")
-        upload_sizer = wx.StaticBoxSizer(upload_box, wx.VERTICAL)
-        
-        file_select_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.doc_file_path = wx.TextCtrl(panel, style=wx.TE_READONLY)
-        browse_btn = wx.Button(panel, label="Browse")
-        browse_btn.Bind(wx.EVT_BUTTON, self.on_browse_document)
-        
-        file_select_sizer.Add(self.doc_file_path, 1, wx.EXPAND | wx.RIGHT, 5)
-        file_select_sizer.Add(browse_btn, 0)
-        
-        upload_sizer.Add(file_select_sizer, 0, wx.EXPAND | wx.ALL, 5)
-        
-        upload_btn = wx.Button(panel, label="Upload Document")
-        upload_btn.Bind(wx.EVT_BUTTON, self.on_upload_document)
-        upload_sizer.Add(upload_btn, 0, wx.EXPAND | wx.ALL, 5)
-        
-        sizer.Add(upload_sizer, 0, wx.EXPAND | wx.ALL, 10)
-        
-        # Document selection section
-        select_box = wx.StaticBox(panel, label="Document Selection")
-        select_sizer = wx.StaticBoxSizer(select_box, wx.VERTICAL)
-        
-        self.document_list = wx.CheckListBox(panel, style=wx.LB_MULTIPLE)
-        select_sizer.Add(self.document_list, 1, wx.EXPAND | wx.ALL, 5)
-        
-        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        refresh_btn = wx.Button(panel, label="Refresh List")
-        refresh_btn.Bind(wx.EVT_BUTTON, self.on_refresh_documents)
-        select_btn = wx.Button(panel, label="Use Selected Documents")
-        select_btn.Bind(wx.EVT_BUTTON, self.on_select_documents)
-        clear_btn = wx.Button(panel, label="Clear Selection")
-        clear_btn.Bind(wx.EVT_BUTTON, self.on_clear_document_selection)
-        
-        btn_sizer.Add(refresh_btn, 1, wx.RIGHT, 5)
-        btn_sizer.Add(select_btn, 1, wx.RIGHT, 5)
-        btn_sizer.Add(clear_btn, 1)
-        
-        select_sizer.Add(btn_sizer, 0, wx.EXPAND | wx.ALL, 5)
-        
-        sizer.Add(select_sizer, 1, wx.EXPAND | wx.ALL, 10)
-        
-        # Document preview section
-        preview_box = wx.StaticBox(panel, label="Document Preview")
-        preview_sizer = wx.StaticBoxSizer(preview_box, wx.VERTICAL)
-        
-        self.document_preview = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY)
-        preview_sizer.Add(self.document_preview, 1, wx.EXPAND | wx.ALL, 5)
-        
-        sizer.Add(preview_sizer, 1, wx.EXPAND | wx.ALL, 10)
-        
-        panel.SetSizer(sizer)
-        
-        # Initial refresh
-        self.on_refresh_documents(None)
         
     def create_chat_panel(self):
         """Create the chat panel."""
@@ -1019,10 +875,6 @@ class MainFrame(wx.Frame):
         
     def bind_events(self):
         """Bind events to handlers."""
-        # Document list double-click event
-        if hasattr(self, 'document_list'):
-            self.document_list.Bind(wx.EVT_LISTBOX_DCLICK, self.document_list_dclick)
-        
         # Enter key in prompt input
         if hasattr(self, 'prompt_input'):
             self.prompt_input.Bind(wx.EVT_TEXT_ENTER, self.on_send_prompt)
@@ -1426,81 +1278,14 @@ class MainFrame(wx.Frame):
         if hasattr(self, 'summarize_btn'):
             self.summarize_btn.Enable(has_transcript)
         
-    def on_browse_document(self, event):
-        """Handle document file browse button."""
-        wildcard = "All files (*.*)|*.*"
-        with wx.FileDialog(self, "Choose a document", wildcard=wildcard,
-                           style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as file_dialog:
-            if file_dialog.ShowModal() == wx.ID_CANCEL:
-                return
-                
-            path = file_dialog.GetPath()
-            self.doc_file_path.SetValue(path)
-            
-    def on_upload_document(self, event):
-        """Handle document upload."""
-        if not self.doc_file_path.GetValue():
-            wx.MessageBox("Please select a document file first.", "No File Selected", wx.OK | wx.ICON_INFORMATION)
-            return
-            
-        try:
-            result = self.document_manager.add_document(self.doc_file_path.GetValue())
-            if result:
-                wx.MessageBox(f"Document '{result}' uploaded successfully.", "Upload Complete", wx.OK | wx.ICON_INFORMATION)
-                self.doc_file_path.SetValue("")
-                self.on_refresh_documents(None)
-        except Exception as e:
-            wx.MessageBox(f"Error uploading document: {str(e)}", "Upload Error", wx.OK | wx.ICON_ERROR)
-            
-    def on_refresh_documents(self, event):
-        """Refresh the document list."""
-        self.document_list.Clear()
-        documents = self.document_manager.get_document_list()
-        for doc in documents:
-            self.document_list.Append(doc)
-            
-    def on_select_documents(self, event):
-        """Handle document selection."""
-        selected_indices = self.document_list.GetChecked()
-        if not selected_indices:
-            wx.MessageBox("Please select at least one document.", "No Selection", wx.OK | wx.ICON_INFORMATION)
-            return
-            
-        selected_documents = [self.document_list.GetString(i) for i in selected_indices]
-        self.document_manager.select_documents(selected_documents)
-        
-        # Show selection in preview
-        preview_text = "Selected Documents:\n\n"
-        for doc in selected_documents:
-            preview_text += f"- {doc}\n"
-        self.document_preview.SetValue(preview_text)
-        
-    def on_clear_document_selection(self, event):
-        """Clear document selection."""
-        self.document_manager.clear_selection()
-        for i in range(self.document_list.GetCount()):
-            self.document_list.Check(i, False)
-        self.document_preview.SetValue("")
-        
-    def document_list_dclick(self, event):
-        """Handle double-click on document list."""
-        index = event.GetSelection()
-        if index != wx.NOT_FOUND:
-            doc_name = self.document_list.GetString(index)
-            content = self.document_manager.get_document_content(doc_name)
-            self.document_preview.SetValue(f"Document: {doc_name}\n\n{content}")
-        
     def on_send_message(self, event):
         """Handle sending a message in the chat."""
         user_input = self.user_input.GetValue()
         if not user_input:
             return
             
-        # Get selected documents content
-        documents_content = self.document_manager.get_selected_documents_content()
-        
         # Generate response
-        response = self.llm_processor.generate_response(user_input, documents_content)
+        response = self.llm_processor.generate_response(user_input)
         
         # Update chat history
         self.chat_history_text.AppendText(f"You: {user_input}\n")
