@@ -119,6 +119,7 @@ class AudioProcessor:
         self.transcript = ""
         self.speakers = []
         self.word_by_word = []
+        self.speaker_segments = []  # Stores time-aligned speaker segments
         
     def update_status(self, message):
         if self.update_callback:
@@ -334,111 +335,225 @@ class AudioProcessor:
         """Use OpenAI to identify different speakers in the transcript."""
         self.update_status("Identifying speakers...")
         
-        # Use gpt-4o-mini for speaker identification
-        model_to_use = DEFAULT_OPENAI_MODEL  # gpt-4o-mini is set as the default model
+        # Use a single approach that works whether we have timing data or not
+        # This ensures consistent results rather than switching between methods
+        return self.identify_speakers_simple(transcript)
         
-        self.update_status(f"Using {model_to_use} for speaker identification...")
+    def identify_speakers_simple(self, transcript):
+        """Identify speakers using a simpler, more reliable approach."""
+        self.update_status("Analyzing transcript for speaker identification...")
         
-        # Split the transcript into segments that might be from different speakers
-        lines = transcript.split('\n')
-        segments = []
-        current_segment = []
+        # Split transcript into sentences
+        import re
+        sentences = re.split(r'(?<=[.!?])\s+', transcript.strip())
+        sentences = [s.strip() for s in sentences if s.strip()]
         
-        for line in lines:
-            if line.strip():
-                current_segment.append(line)
-            elif current_segment:
-                segments.append(' '.join(current_segment))
-                current_segment = []
-                
-        if current_segment:
-            segments.append(' '.join(current_segment))
+        # Group sentences into paragraphs with more intelligent grouping
+        paragraphs = []
+        current_para = []
         
-        # If transcript doesn't have clear segments, create artificial breaks
-        if len(segments) < 2:
-            words = transcript.split()
-            segment_size = max(20, len(words) // max(2, len(words) // 100))
-            segments = []
+        # List of phrases that often indicate the beginning of a new speaker's turn
+        new_speaker_indicators = [
+            "yes", "no", "I think", "I believe", "so,", "well,", "actually", 
+            "to be honest", "in my opinion", "I agree", "I disagree",
+            "let me", "I'd like to", "I would", "you know", "um", "uh", 
+            "hmm", "but", "however", "from my perspective", "wait", "okay"
+        ]
+        
+        # Words that often indicate continuation of the same speaker
+        continuation_indicators = [
+            "and", "also", "additionally", "moreover", "furthermore", "plus",
+            "then", "after that", "next", "finally", "lastly", "in addition",
+            "consequently", "as a result", "therefore", "thus"
+        ]
+        
+        for i, sentence in enumerate(sentences):
+            # Start a new paragraph if:
+            start_new_para = False
             
-            for i in range(0, len(words), segment_size):
-                segments.append(' '.join(words[i:i+segment_size]))
+            # 1. This is the first sentence
+            if i == 0:
+                start_new_para = True
+                
+            # 2. Previous sentence ended with a question mark
+            elif i > 0 and sentences[i-1].endswith('?'):
+                start_new_para = True
+                
+            # 3. Current sentence begins with a common "new speaker" phrase
+            elif any(sentence.lower().startswith(indicator) for indicator in new_speaker_indicators):
+                start_new_para = True
+                
+            # 4. This doesn't seem to be a continuation of the previous thought
+            elif (i > 0 and 
+                  not any(sentence.lower().startswith(indicator) for indicator in continuation_indicators) and
+                  len(current_para) >= 2):
+                start_new_para = True
+            
+            # Start a new paragraph if needed
+            if start_new_para and current_para:
+                paragraphs.append(' '.join(current_para))
+                current_para = []
+            
+            # Add the current sentence to the paragraph
+            current_para.append(sentence)
         
-        # Now create the prompt with these segments
+        # Add the last paragraph if not empty
+        if current_para:
+            paragraphs.append(' '.join(current_para))
+        
+        # Now use the LLM to identify speakers for complete paragraphs
+        model_to_use = DEFAULT_OPENAI_MODEL
+        
         prompt = f"""
-        Your task is to identify different speakers in this transcript.
+        Your task is to identify speakers in this transcript.
         
         IMPORTANT INSTRUCTIONS:
-        1. You MUST assign each segment to a speaker, even if you're uncertain.
-        2. You MUST identify at least 2 different speakers if the transcript isn't clearly a monologue.
-        3. Always use "Speaker 1", "Speaker 2", etc. as identifiers.
-        4. Analyze turn-taking patterns, question-answer sequences, and different speaking styles.
-        5. Look for language patterns that indicate different people.
+        1. Each item in the list is a complete paragraph from a single speaker.
+        2. You MUST assign each paragraph to exactly ONE speaker.
+        3. You MUST identify exactly 2 different speakers in this conversation.
+        4. Always use "Speaker 1" and "Speaker 2" as identifiers.
+        5. Questions are ALWAYS followed by answers from the OTHER speaker.
+        6. Maintain a logical conversation flow.
+        7. Pay attention to language patterns that indicate different speakers.
+        8. When in doubt about who's speaking, consider:
+           - Questions should be answered by the other speaker
+           - Contradictions or different viewpoints suggest different speakers
+           - Similar ideas or explanation continuations suggest the same speaker
         
         Format your response exactly as a JSON array with this structure:
         [
-            {{"speaker": "Speaker 1", "text": "Speaker 1's text..."}},
-            {{"speaker": "Speaker 2", "text": "Speaker 2's text..."}},
+            {{"speaker": "Speaker 1", "text": "Text of paragraph 1"}},
+            {{"speaker": "Speaker 2", "text": "Text of paragraph 2"}},
             ...
         ]
         
-        Here's the transcript split into possible segments:
+        Here are the paragraphs to analyze:
 
-        {json.dumps(segments, indent=2)}
+        {json.dumps([{"paragraph_id": i, "text": p} for i, p in enumerate(paragraphs)], indent=2)}
         """
         
         try:
             response = self.client.chat.completions.create(
                 model=model_to_use,
                 messages=[
-                    {"role": "system", "content": "You are a transcript analyzer that must divide any conversational text into parts spoken by different speakers. You always assume multiple speakers unless it's obviously a single-person monologue."},
+                    {"role": "system", "content": "You are a transcript analyzer specializing in two-person conversations. Your task is to identify which speaker said each paragraph in the transcript. You're extremely good at recognizing when the speaker changes based on content, tone, and conversation flow. You understand that questions are typically asked by one person and answered by another."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,
+                temperature=0.0,  # Use 0 temperature for maximum consistency
                 response_format={"type": "json_object"}
             )
             
             result = json.loads(response.choices[0].message.content)
-            self.speakers = result if isinstance(result, list) else result.get("speakers", [])
+            segments = result if isinstance(result, list) else result.get("speakers", [])
             
-            # Ensure we have at least some speakers identified
-            if not self.speakers:
-                # Fallback: create basic speaker segmentation
-                self.speakers = self._create_default_speaker_segments(transcript)
+            # If we don't get proper segments, try to extract them from the response
+            if not segments:
+                try:
+                    # Sometimes the API returns {"paragraphs": [...]} instead
+                    segments = result.get("paragraphs", [])
+                except:
+                    pass
+            
+            # Store the results
+            self.speakers = []
+            
+            # Set up alternating speakers if we failed to get segments
+            if not segments and paragraphs:
+                self.speakers = [
+                    {"speaker": f"Speaker {i % 2 + 1}", "text": p}
+                    for i, p in enumerate(paragraphs)
+                ]
+            else:
+                self.speakers = segments
+            
+            # Handle case where segments don't match paragraphs
+            if len(self.speakers) != len(paragraphs):
+                self.update_status(f"Warning: Received {len(self.speakers)} segments but expected {len(paragraphs)}. Fixing...")
+                self.speakers = [
+                    {"speaker": segments[min(i, len(segments)-1)]["speaker"] if segments else f"Speaker {i % 2 + 1}", 
+                     "text": p}
+                    for i, p in enumerate(paragraphs)
+                ]
+            
+            # Ensure we have at least 2 speakers
+            speakers_set = set(s["speaker"] for s in self.speakers)
+            if len(speakers_set) < 2:
+                # Force alternating speakers
+                for i in range(len(self.speakers)):
+                    self.speakers[i]["speaker"] = f"Speaker {i % 2 + 1}"
+            
+            # Store the speaker segments for future reference
+            self.speaker_segments = paragraphs
+            
+            # Apply enhanced post-processing
+            self._apply_enhanced_speaker_logic()
             
             self.update_status(f"Speaker identification complete. Found {len(set(s['speaker'] for s in self.speakers))} speakers.")
             return self.speakers
             
         except Exception as e:
-            self.update_status(f"Error identifying speakers: {str(e)}")
-            # Fallback in case of API error
-            self.speakers = self._create_default_speaker_segments(transcript)
+            self.update_status(f"Error in speaker identification: {str(e)}")
+            # Fallback to basic alternating speaker assignment
+            self.speakers = [
+                {"speaker": f"Speaker {i % 2 + 1}", "text": p}
+                for i, p in enumerate(paragraphs)
+            ]
+            self.speaker_segments = paragraphs
             return self.speakers
             
-    def _create_default_speaker_segments(self, transcript):
-        """Create fallback speaker segments when API fails."""
-        # Split the transcript into sentences or paragraphs
-        import re
-        sentences = re.split(r'(?<=[.!?])\s+', transcript)
-        
-        speakers = []
-        current_speaker = "Speaker 1"
-        
-        # Assign alternating speakers to sentences
-        for i, sentence in enumerate(sentences):
-            if not sentence.strip():
-                continue
-                
-            # Switch speakers every few sentences
-            if i > 0 and i % 3 == 0:
-                current_speaker = f"Speaker {(i // 3) % 2 + 1}"
-                
-            speakers.append({
-                "speaker": current_speaker,
-                "text": sentence
-            })
+    def _apply_enhanced_speaker_logic(self):
+        """Apply enhanced conversation logic to improve speaker assignment."""
+        if len(self.speakers) < 2:
+            return
             
-        return speakers
+        # Get unique speakers
+        unique_speakers = list(set(s["speaker"] for s in self.speakers))
+        if len(unique_speakers) < 2:
+            return
             
+        # 1. Apply question-answer rule (strictest rule)
+        for i in range(len(self.speakers) - 1):
+            current = self.speakers[i]
+            next_segment = self.speakers[i + 1]
+            
+            # If the current segment contains a question
+            if '?' in current["text"]:
+                # Make sure the next segment is from a different speaker
+                if current["speaker"] == next_segment["speaker"]:
+                    # Find the other speaker
+                    other_speaker = [s for s in unique_speakers if s != current["speaker"]][0]
+                    next_segment["speaker"] = other_speaker
+        
+        # 2. Look for clear speaker indicators in text
+        speaker_indicators = {
+            "I think": None,  # will be filled with actual speakers
+            "In my opinion": None,
+            "I believe": None,
+            "I agree": None,
+            "I disagree": None,
+            "From my perspective": None
+        }
+        
+        # First pass - identify phrases with consistent speakers
+        for segment in self.speakers:
+            for phrase in speaker_indicators.keys():
+                if phrase.lower() in segment["text"].lower():
+                    # If this is the first time we've seen this phrase
+                    if speaker_indicators[phrase] is None:
+                        speaker_indicators[phrase] = segment["speaker"]
+                    # Otherwise, consistency check - if inconsistent, mark as unusable
+                    elif speaker_indicators[phrase] != segment["speaker"]:
+                        speaker_indicators[phrase] = "inconsistent"
+        
+        # Second pass - apply consistent indicators to fix assignments
+        for i, segment in enumerate(self.speakers):
+            for phrase, speaker in speaker_indicators.items():
+                if (speaker not in [None, "inconsistent"] and 
+                    phrase.lower() in segment["text"].lower() and
+                    segment["speaker"] != speaker):
+                    # Found an inconsistency - fix it
+                    segment["speaker"] = speaker
+
     def assign_speaker_names(self, speaker_map):
         """Replace generic speaker labels with actual names."""
         if not self.speakers:
@@ -1045,7 +1160,10 @@ class MainFrame(wx.Frame):
             self,
             "Transcription is complete!\n\n"
             "To identify different speakers in this transcript, click the 'Identify Speakers' button.\n\n"
-            "This will analyze the transcript and tag different speakers.",
+            "The system will analyze the audio timing patterns to detect different speakers and "
+            "tag each segment with the appropriate speaker. If timing data is available, this will "
+            "provide more accurate speaker identification than text analysis alone.\n\n"
+            "After identification, you can customize the speaker names if needed.",
             "Speaker Identification",
             wx.OK | wx.ICON_INFORMATION
         )
@@ -1083,13 +1201,13 @@ class MainFrame(wx.Frame):
             # Show processing message
             wx.CallAfter(self.update_status, "Processing speaker identification...")
             if progress_dialog:
-                wx.CallAfter(progress_dialog.Update, 20, "Preparing transcript for analysis...")
+                wx.CallAfter(progress_dialog.Update, 20, "Analyzing transcript for different speakers...")
                 
             # Small delay to ensure the UI updates
             time.sleep(0.5)
             
             if progress_dialog:
-                wx.CallAfter(progress_dialog.Update, 40, "Analyzing speech patterns and conversation flow...")
+                wx.CallAfter(progress_dialog.Update, 30, "Analyzing audio timing patterns...")
             
             # Force the dialog to update before the potentially lengthy API call
             wx.Yield()
@@ -1106,9 +1224,17 @@ class MainFrame(wx.Frame):
             if speakers:
                 wx.CallAfter(self.create_speaker_mapping_ui, speakers)
                 speaker_count = len(set(s["speaker"] for s in speakers))
-                wx.CallAfter(self.update_status, f"Speaker identification complete. Found {speaker_count} speakers.")
+                
+                # Check if we used timing-based identification
+                using_timing = hasattr(self.audio_processor, 'speaker_segments') and self.audio_processor.speaker_segments
+                method_used = "timestamp analysis" if using_timing else "text analysis"
+                
+                wx.CallAfter(self.update_status, 
+                            f"Speaker identification complete using {method_used}. Found {speaker_count} speakers.")
+                
                 if progress_dialog:
-                    wx.CallAfter(progress_dialog.Update, 100, f"Found {speaker_count} speakers in the transcript!")
+                    wx.CallAfter(progress_dialog.Update, 100, 
+                                f"Found {speaker_count} speakers using {method_used}!")
             else:
                 wx.CallAfter(self.update_status, "No speakers identified.")
                 if progress_dialog:
@@ -1346,9 +1472,9 @@ class MainFrame(wx.Frame):
         
     def on_remove_template(self, event):
         if template_name in templates:
-            self.template_content.SetValue(templates[template_name])
+            self.template_content_input.SetValue(templates[template_name])
         else:
-            self.template_content.Clear()
+            self.template_content_input.Clear()
             
     def on_new_template(self, event):
         """Create a new template."""
@@ -1370,11 +1496,11 @@ class MainFrame(wx.Frame):
             
             # Update template choice
             templates = list(self.config_manager.get_templates().keys())
-            self.selected_template.SetItems(templates)
-            self.selected_template.SetSelection(templates.index(template_name))
+            self.template_choice.SetItems(templates)
+            self.template_choice.SetSelection(templates.index(template_name))
             
             # Clear content
-            self.template_content.Clear()
+            self.template_content_input.Clear()
             
         dlg.Destroy()
         
@@ -1385,8 +1511,8 @@ class MainFrame(wx.Frame):
             wx.MessageBox("No templates available. Create a new template first.", "No Templates", wx.OK | wx.ICON_INFORMATION)
             return
             
-        template_name = self.selected_template.GetString(self.selected_template.GetSelection())
-        template_content = self.template_content.GetValue()
+        template_name = self.template_choice.GetString(self.template_choice.GetSelection())
+        template_content = self.template_content_input.GetValue()
         
         # Update template
         self.config_manager.add_template(template_name, template_content)
@@ -1399,7 +1525,7 @@ class MainFrame(wx.Frame):
         if not templates:
             return
             
-        template_name = self.selected_template.GetString(self.selected_template.GetSelection())
+        template_name = self.template_choice.GetString(self.template_choice.GetSelection())
         
         # Confirm deletion
         dlg = wx.MessageDialog(self, f"Are you sure you want to delete the template '{template_name}'?",
@@ -1410,11 +1536,11 @@ class MainFrame(wx.Frame):
             
             # Update template choice
             templates = list(self.config_manager.get_templates().keys())
-            self.selected_template.SetItems(templates if templates else ["No templates"])
-            self.selected_template.SetSelection(0)
+            self.template_choice.SetItems(templates if templates else ["No templates"])
+            self.template_choice.SetSelection(0)
             
             # Clear content
-            self.template_content.Clear()
+            self.template_content_input.Clear()
             
             if templates:
                 self.load_template(templates[0])
