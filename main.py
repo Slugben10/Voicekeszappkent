@@ -16,6 +16,7 @@ import re
 import io
 import subprocess
 import wave
+import numpy as np
 
 # Check if pydub is available for audio conversion
 try:
@@ -23,6 +24,17 @@ try:
     PYDUB_AVAILABLE = True
 except ImportError:
     PYDUB_AVAILABLE = False
+
+# Check if pyannote is available for speaker diarization
+try:
+    import torch
+    import pyannote.audio
+    from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
+    from pyannote.audio import Audio
+    from pyannote.core import Segment
+    PYANNOTE_AVAILABLE = True
+except ImportError:
+    PYANNOTE_AVAILABLE = False
 
 # Ensure required directories exist
 def ensure_directories():
@@ -60,6 +72,7 @@ class ConfigManager:
             "temperature": 0.7,
             "language": "english",  # Default language
             "shown_format_info": False,  # Whether we've shown the format info message
+            "pyannote_token": "",  # Add token to config
             "templates": {
                 "meeting_notes": "# Meeting Summary\n\n## Participants\n{participants}\n\n## Key Points\n{key_points}\n\n## Action Items\n{action_items}",
                 "interview": "# Interview Summary\n\n## Interviewee\n{interviewee}\n\n## Main Topics\n{topics}\n\n## Key Insights\n{insights}",
@@ -110,16 +123,26 @@ class ConfigManager:
         if name in self.config.get("templates", {}):
             del self.config["templates"][name]
             self.save_config()
+    
+    # Add methods to get/set pyannote token
+    def get_pyannote_token(self):
+        return self.config.get("pyannote_token", "")
+    
+    def set_pyannote_token(self, token):
+        self.config["pyannote_token"] = token
+        self.save_config()
 
 # Audio Processing Class
 class AudioProcessor:
-    def __init__(self, client, update_callback=None):
+    def __init__(self, client, update_callback=None, config_manager=None):
         self.client = client
         self.update_callback = update_callback
+        self.config_manager = config_manager
         self.transcript = ""
         self.speakers = []
         self.word_by_word = []
         self.speaker_segments = []  # Stores time-aligned speaker segments
+        self.diarization = None  # Will store pyannote diarization results
         
     def update_status(self, message):
         if self.update_callback:
@@ -240,6 +263,9 @@ class AudioProcessor:
         converted_file = None
         
         try:
+            # Save the audio file path for later diarization
+            self.audio_file_path = file_path
+            
             # Validate the audio file
             self.validate_audio_file(file_path)
             
@@ -335,10 +361,170 @@ class AudioProcessor:
         """Use OpenAI to identify different speakers in the transcript."""
         self.update_status("Identifying speakers...")
         
-        # Use a single approach that works whether we have timing data or not
-        # This ensures consistent results rather than switching between methods
-        return self.identify_speakers_simple(transcript)
+        # Check if we have the audio file and PyAnnote is available
+        if hasattr(self, 'audio_file_path') and self.audio_file_path and PYANNOTE_AVAILABLE:
+            try:
+                return self.identify_speakers_with_diarization(self.audio_file_path, transcript)
+            except Exception as e:
+                self.update_status(f"Diarization error: {str(e)}. Falling back to text-based analysis.")
+                return self.identify_speakers_simple(transcript)
+        else:
+            # Fall back to text-based approach
+            return self.identify_speakers_simple(transcript)
+    
+    def identify_speakers_with_diarization(self, audio_file_path, transcript):
+        """Identify speakers using audio diarization with PyAnnote."""
+        self.update_status("Performing audio diarization analysis...")
         
+        # Check if PyAnnote is available
+        if not PYANNOTE_AVAILABLE:
+            self.update_status("PyAnnote not available. Install with: pip install pyannote.audio")
+            return self.identify_speakers_simple(transcript)
+        
+        # Step 1: Initialize PyAnnote pipeline
+        try:
+            # Get token from config_manager if available
+            token = None
+            if self.config_manager:
+                token = self.config_manager.get_pyannote_token()
+            
+            # If not found, check for a token file as a fallback
+            if not token:
+                token_file = "pyannote_token.txt"
+                if os.path.exists(token_file):
+                    with open(token_file, "r") as f:
+                        file_token = f.read().strip()
+                        if not file_token.startswith("#") and len(file_token) >= 10:
+                            token = file_token
+            
+            # If still no token, show message and fall back to text-based identification
+            if not token:
+                self.update_status("PyAnnote token not found in settings. Please add your token in the Settings tab.")
+                return self.identify_speakers_simple(transcript)
+            
+            self.update_status("Initializing diarization pipeline...")
+            
+            # Initialize the PyAnnote pipeline
+            pipeline = pyannote.audio.Pipeline.from_pretrained(
+                "pyannote/speaker-diarization@2.1",
+                use_auth_token=token
+            )
+            
+            # Set device (GPU if available)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            pipeline = pipeline.to(torch.device(device))
+            
+            # Convert the file to WAV format if needed
+            if not audio_file_path.lower().endswith('.wav'):
+                self.update_status("Converting audio to WAV format for diarization...")
+                converted_file = self.convert_to_wav(audio_file_path)
+                diarization_file = converted_file
+            else:
+                diarization_file = audio_file_path
+            
+            # Apply diarization
+            self.update_status("Applying diarization to audio file (this may take time for longer files)...")
+            self.diarization = pipeline(diarization_file)
+            
+            # Clean up converted file if needed
+            if diarization_file != audio_file_path and os.path.exists(diarization_file):
+                os.unlink(diarization_file)
+            
+            # Now we have diarization data, map it to the transcript using word timestamps
+            return self._map_diarization_to_transcript(transcript)
+            
+        except Exception as e:
+            self.update_status(f"Error in diarization: {str(e)}")
+            # Fall back to text-based approach
+            return self.identify_speakers_simple(transcript)
+    
+    def _map_diarization_to_transcript(self, transcript):
+        """Map diarization results to the transcript using word timings."""
+        self.update_status("Mapping diarization results to transcript...")
+        
+        if not hasattr(self, 'word_by_word') or not self.word_by_word or not self.diarization:
+            return self.identify_speakers_simple(transcript)
+        
+        try:
+            # Create a speaker mapping dictionary based on diarization
+            speaker_map = {}
+            for turn, _, speaker in self.diarization.itertracks(yield_label=True):
+                start_time = turn.start
+                end_time = turn.end
+                
+                # Map this time segment to a speaker
+                for t in np.arange(start_time, end_time, 0.1):  # Sample every 0.1 seconds
+                    speaker_map[round(t, 1)] = speaker
+            
+            # Split transcript into paragraphs (either use existing paragraphs or create new ones)
+            if hasattr(self, 'speaker_segments') and self.speaker_segments:
+                paragraphs = self.speaker_segments
+            else:
+                paragraphs = self._create_improved_paragraphs(transcript)
+                self.speaker_segments = paragraphs
+            
+            # For each word in the transcript, find its speaker
+            word_speakers = {}
+            for word_info in self.word_by_word:
+                if not hasattr(word_info, "start") or not hasattr(word_info, "end"):
+                    continue
+                
+                word_start = word_info.start
+                word_end = word_info.end
+                word = word_info.word
+                
+                # Sample time points within the word duration
+                times = np.arange(word_start, word_end, 0.1)
+                if len(times) == 0:
+                    times = [word_start]
+                
+                # Find the most common speaker for this word
+                speakers_for_word = []
+                for t in times:
+                    rounded_t = round(t, 1)
+                    if rounded_t in speaker_map:
+                        speakers_for_word.append(speaker_map[rounded_t])
+                
+                if speakers_for_word:
+                    # Find most common speaker for this word
+                    most_common_speaker = max(set(speakers_for_word), key=speakers_for_word.count)
+                    word_speakers[word] = most_common_speaker
+            
+            # Now assign speakers to paragraphs based on majority of words
+            self.speakers = []
+            for i, paragraph in enumerate(paragraphs):
+                para_speakers = []
+                
+                # Split paragraph into words
+                words = re.findall(r'\b\w+\b', paragraph.lower())
+                
+                # Count speakers for each word in paragraph
+                for word in words:
+                    if word in word_speakers:
+                        para_speakers.append(word_speakers[word])
+                
+                # Find the most common speaker for this paragraph
+                if para_speakers:
+                    most_common_speaker = max(set(para_speakers), key=para_speakers.count)
+                    # Format as "Speaker X" where X is the speaker ID from diarization
+                    speaker_id = f"Speaker {most_common_speaker.split('_')[-1]}"
+                else:
+                    # Fallback if no speaker info
+                    speaker_id = f"Speaker {(i % 2) + 1}"
+                
+                self.speakers.append({
+                    "speaker": speaker_id,
+                    "text": paragraph
+                })
+            
+            self.update_status(f"Diarization complete. Found {len(set(s['speaker'] for s in self.speakers))} speakers.")
+            return self.speakers
+            
+        except Exception as e:
+            self.update_status(f"Error mapping diarization: {str(e)}")
+            # Fall back to text-based approach if mapping fails
+            return self.identify_speakers_simple(transcript)
+    
     def identify_speakers_simple(self, transcript):
         """Identify speakers using a context-enhanced role-based approach."""
         self.update_status("Analyzing transcript for speaker identification...")
@@ -890,7 +1076,7 @@ class MainFrame(wx.Frame):
         self.initialize_openai_client()
         
         # Initialize processors
-        self.audio_processor = AudioProcessor(client, self.update_status)
+        self.audio_processor = AudioProcessor(client, self.update_status, self.config_manager)
         self.llm_processor = LLMProcessor(client, self.config_manager, self.update_status)
         
         # Set up the UI
@@ -911,6 +1097,9 @@ class MainFrame(wx.Frame):
         # Display info about supported audio formats
         wx.CallLater(1000, self.show_format_info)
         
+        # Check for PyAnnote and display installation message if needed
+        wx.CallLater(1500, self.check_pyannote)
+    
     def initialize_openai_client(self):
         """Initialize OpenAI client with API key."""
         global client
@@ -943,6 +1132,9 @@ class MainFrame(wx.Frame):
         self.notebook.AddPage(self.chat_panel, "Chat")
         self.notebook.AddPage(self.settings_panel, "Settings")
         
+        # Bind the notebook page change event
+        self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.on_notebook_page_changed)
+        
         # Create UI for each panel
         self.create_audio_panel()
         self.create_chat_panel()
@@ -957,6 +1149,20 @@ class MainFrame(wx.Frame):
         main_sizer.Add(self.notebook, 1, wx.EXPAND | wx.ALL, 5)
         
         self.SetSizer(main_sizer)
+        
+    def on_notebook_page_changed(self, event):
+        """Handle notebook page change event."""
+        old_page = event.GetOldSelection()
+        new_page = event.GetSelection()
+        
+        # If user switched from settings to audio tab, update the speaker ID button styling
+        if old_page == 2 and new_page == 0:  # 2 = settings, 0 = audio
+            self.identify_speakers_btn.SetLabel(self.get_speaker_id_button_label())
+            self.speaker_id_help_text.SetLabel(self.get_speaker_id_help_text())
+            self.update_speaker_id_button_style()
+            self.audio_panel.Layout()
+            
+        event.Skip()  # Allow default event processing
         
     def create_audio_panel(self):
         """Create the audio processing panel."""
@@ -1010,15 +1216,19 @@ class MainFrame(wx.Frame):
         button_font = wx.Font(wx.NORMAL_FONT.GetPointSize(), wx.FONTFAMILY_DEFAULT, 
                            wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
         
-        self.identify_speakers_btn = wx.Button(panel, label="Identify Speakers in Transcript")
+        # Create button with appropriate styling based on PyAnnote status
+        self.identify_speakers_btn = wx.Button(panel, label=self.get_speaker_id_button_label())
         self.identify_speakers_btn.SetFont(button_font)
-        self.identify_speakers_btn.SetBackgroundColour(wx.Colour(220, 230, 255))  # Light blue background
+        
+        # Set button color based on PyAnnote status
+        self.update_speaker_id_button_style()
+        
         self.identify_speakers_btn.Bind(wx.EVT_BUTTON, self.on_identify_speakers)
         speaker_sizer.Add(self.identify_speakers_btn, 0, wx.EXPAND | wx.ALL, 5)
         
-        # Add a help text
-        help_text = wx.StaticText(panel, label="Click above to detect and label different speakers in your transcript")
-        speaker_sizer.Add(help_text, 0, wx.CENTER | wx.ALL, 5)
+        # Add a help text that will also be updated based on PyAnnote status
+        self.speaker_id_help_text = wx.StaticText(panel, label=self.get_speaker_id_help_text())
+        speaker_sizer.Add(self.speaker_id_help_text, 0, wx.CENTER | wx.ALL, 5)
         
         # Speaker mapping UI
         self.speaker_mapping_panel = wx.Panel(panel)
@@ -1060,6 +1270,55 @@ class MainFrame(wx.Frame):
         
         # Initial button states
         self.update_button_states()
+        
+    def get_speaker_id_button_label(self):
+        """Get the appropriate label for the speaker identification button."""
+        if PYANNOTE_AVAILABLE and self.config_manager.get_pyannote_token():
+            return "Identify Speakers using Audio Analysis"
+        elif PYANNOTE_AVAILABLE:
+            return "Identify Speakers (Token Required)"
+        else:
+            return "Identify Speakers using Text Analysis"
+            
+    def get_speaker_id_help_text(self):
+        """Get the appropriate help text for speaker identification."""
+        if PYANNOTE_AVAILABLE and self.config_manager.get_pyannote_token():
+            return "Click above to detect speakers using voice analysis (more accurate)"
+        elif PYANNOTE_AVAILABLE:
+            return "PyAnnote is installed but requires a token. See Settings tab."
+        else:
+            return "Click above to detect speakers using text patterns"
+            
+    def update_speaker_id_button_style(self):
+        """Update the style of the speaker identification button based on PyAnnote status."""
+        if not hasattr(self, 'identify_speakers_btn'):
+            return
+            
+        if PYANNOTE_AVAILABLE and self.config_manager.get_pyannote_token():
+            # PyAnnote available and token configured - green button
+            self.identify_speakers_btn.SetBackgroundColour(wx.Colour(200, 255, 200))  # Light green
+            self.identify_speakers_btn.SetForegroundColour(wx.Colour(0, 100, 0))      # Dark green
+        elif PYANNOTE_AVAILABLE:
+            # PyAnnote available but token missing - orange button
+            self.identify_speakers_btn.SetBackgroundColour(wx.Colour(255, 224, 178))  # Light orange
+            self.identify_speakers_btn.SetForegroundColour(wx.Colour(153, 76, 0))     # Dark orange
+        else:
+            # PyAnnote not available - light blue button (original style)
+            self.identify_speakers_btn.SetBackgroundColour(wx.Colour(220, 230, 255))  # Light blue
+            self.identify_speakers_btn.SetForegroundColour(wx.BLACK)
+            
+    def on_save_pyannote_token(self, event):
+        """Save the PyAnnote token."""
+        token = self.pyannote_token_input.GetValue()
+        self.config_manager.set_pyannote_token(token)
+        
+        # Update the speaker identification button style
+        self.identify_speakers_btn.SetLabel(self.get_speaker_id_button_label())
+        self.speaker_id_help_text.SetLabel(self.get_speaker_id_help_text())
+        self.update_speaker_id_button_style()
+        self.audio_panel.Layout()
+        
+        wx.MessageBox("PyAnnote token saved successfully.", "Success", wx.OK | wx.ICON_INFORMATION)
         
     def create_chat_panel(self):
         """Create the chat panel."""
@@ -1115,6 +1374,33 @@ class MainFrame(wx.Frame):
         api_key_sizer.Add(save_api_key_btn, 0, wx.EXPAND | wx.ALL, 5)
         
         sizer.Add(api_key_sizer, 0, wx.EXPAND | wx.ALL, 10)
+        
+        # PyAnnote token section
+        pyannote_box = wx.StaticBox(panel, label="PyAnnote Speaker Diarization")
+        pyannote_sizer = wx.StaticBoxSizer(pyannote_box, wx.VERTICAL)
+        
+        # Add a help text
+        help_text = wx.StaticText(panel, 
+                      label="To enable audio-based speaker identification, enter your Hugging Face token below:")
+        pyannote_sizer.Add(help_text, 0, wx.EXPAND | wx.ALL, 5)
+        
+        self.pyannote_token_input = wx.TextCtrl(panel)
+        self.pyannote_token_input.SetValue(self.config_manager.get_pyannote_token())
+        pyannote_sizer.Add(self.pyannote_token_input, 0, wx.EXPAND | wx.ALL, 5)
+        
+        pyannote_btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        
+        save_pyannote_btn = wx.Button(panel, label="Save Token")
+        save_pyannote_btn.Bind(wx.EVT_BUTTON, self.on_save_pyannote_token)
+        pyannote_btn_sizer.Add(save_pyannote_btn, 1, wx.RIGHT, 5)
+        
+        get_token_btn = wx.Button(panel, label="Get Token Instructions")
+        get_token_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_pyannote_setup_guide())
+        pyannote_btn_sizer.Add(get_token_btn, 1)
+        
+        pyannote_sizer.Add(pyannote_btn_sizer, 0, wx.EXPAND | wx.ALL, 5)
+        
+        sizer.Add(pyannote_sizer, 0, wx.EXPAND | wx.ALL, 10)
         
         # Model selection section
         model_box = wx.StaticBox(panel, label="Model Selection")
@@ -1269,6 +1555,10 @@ class MainFrame(wx.Frame):
         # Save language choice to config
         self.config_manager.set_language("english" if language == "en" else "hungarian")
         
+        # Store the audio file path in the AudioProcessor
+        # This ensures it's available for diarization later
+        self.audio_processor.audio_file_path = self.audio_file_path.GetValue()
+        
         # Update status message
         self.update_status(f"Transcribing in {lang_selection}...")
         
@@ -1355,19 +1645,40 @@ class MainFrame(wx.Frame):
             
     def show_speaker_id_hint(self):
         """Show a hint dialog about using speaker identification."""
+        # Check if PyAnnote is available
+        if PYANNOTE_AVAILABLE:
+            message = (
+                "Transcription is complete!\n\n"
+                "To identify different speakers in this transcript, click the 'Identify Speakers' button.\n\n"
+                "This system will use advanced audio-based speaker diarization to detect different "
+                "speakers by analyzing voice characteristics (pitch, tone, speaking style) from the "
+                "original audio file.\n\n"
+                "This approach is significantly more accurate than text-based analysis since it "
+                "uses the actual voice patterns to distinguish between speakers."
+            )
+        else:
+            message = (
+                "Transcription is complete!\n\n"
+                "To identify different speakers in this transcript, click the 'Identify Speakers' button.\n\n"
+                "Currently, the system will analyze the text patterns to detect different speakers.\n\n"
+                "For more accurate speaker identification, consider installing PyAnnote which uses "
+                "audio analysis to distinguish speakers based on their voice characteristics. "
+                "Click 'Yes' for installation instructions."
+            )
+            
         dlg = wx.MessageDialog(
             self,
-            "Transcription is complete!\n\n"
-            "To identify different speakers in this transcript, click the 'Identify Speakers' button.\n\n"
-            "The system will analyze the audio timing patterns to detect different speakers and "
-            "tag each segment with the appropriate speaker. If timing data is available, this will "
-            "provide more accurate speaker identification than text analysis alone.\n\n"
-            "After identification, you can customize the speaker names if needed.",
+            message,
             "Speaker Identification",
-            wx.OK | wx.ICON_INFORMATION
+            wx.OK | (wx.CANCEL | wx.YES_NO if not PYANNOTE_AVAILABLE else wx.OK) | wx.ICON_INFORMATION
         )
-        dlg.ShowModal()
+        
+        result = dlg.ShowModal()
         dlg.Destroy()
+        
+        # If user wants to install PyAnnote
+        if result == wx.ID_YES:
+            self.show_pyannote_setup_guide()
         
         # Highlight the identify speakers button
         self.identify_speakers_btn.SetFocus()
@@ -1393,7 +1704,7 @@ class MainFrame(wx.Frame):
         
         # Start speaker identification in a separate thread
         threading.Thread(target=self.identify_speakers_thread, args=(progress_dialog,)).start()
-        
+    
     def identify_speakers_thread(self, progress_dialog=None):
         """Thread function for speaker identification."""
         try:
@@ -1405,8 +1716,23 @@ class MainFrame(wx.Frame):
             # Small delay to ensure the UI updates
             time.sleep(0.5)
             
-            if progress_dialog:
-                wx.CallAfter(progress_dialog.Update, 30, "Analyzing audio timing patterns...")
+            # Check if PyAnnote is available but token is missing
+            if PYANNOTE_AVAILABLE and self.config_manager.get_pyannote_token() == "":
+                # Close the progress dialog
+                if progress_dialog:
+                    wx.CallAfter(progress_dialog.Destroy)
+                    
+                # Show a message about setting up the token
+                wx.CallAfter(self.show_token_missing_dialog)
+                return
+                
+            # Check if we're using diarization
+            using_diarization = PYANNOTE_AVAILABLE and hasattr(self.audio_processor, 'audio_file_path') and self.audio_processor.audio_file_path
+            
+            if using_diarization and progress_dialog:
+                wx.CallAfter(progress_dialog.Update, 30, "Performing audio diarization analysis...")
+            elif progress_dialog:
+                wx.CallAfter(progress_dialog.Update, 30, "Analyzing text patterns...")
             
             # Force the dialog to update before the potentially lengthy API call
             wx.Yield()
@@ -1424,9 +1750,8 @@ class MainFrame(wx.Frame):
                 wx.CallAfter(self.create_speaker_mapping_ui, speakers)
                 speaker_count = len(set(s["speaker"] for s in speakers))
                 
-                # Check if we used timing-based identification
-                using_timing = hasattr(self.audio_processor, 'speaker_segments') and self.audio_processor.speaker_segments
-                method_used = "timestamp analysis" if using_timing else "text analysis"
+                # Check which method was used
+                method_used = "audio diarization" if (using_diarization and hasattr(self.audio_processor, 'diarization')) else "text analysis"
                 
                 wx.CallAfter(self.update_status, 
                             f"Speaker identification complete using {method_used}. Found {speaker_count} speakers.")
@@ -1446,6 +1771,67 @@ class MainFrame(wx.Frame):
             wx.CallAfter(self.identify_speakers_btn.Enable)
             wx.CallAfter(self.update_button_states)
             
+    def show_token_missing_dialog(self):
+        """Show a dialog explaining that PyAnnote is installed but the token is missing."""
+        dlg = wx.MessageDialog(
+            self,
+            "PyAnnote is installed, but no token has been configured.\n\n"
+            "Audio-based speaker identification requires a HuggingFace token.\n\n"
+            "Would you like to go to the Settings tab to add your token?",
+            "PyAnnote Token Missing",
+            wx.YES_NO | wx.ICON_INFORMATION
+        )
+        
+        if dlg.ShowModal() == wx.ID_YES:
+            self.notebook.SetSelection(2)  # Switch to settings tab
+            # Add focus to the token input field
+            self.pyannote_token_input.SetFocus()
+        else:
+            # Continue with text-based identification
+            threading.Thread(target=self.continue_with_text_identification).start()
+            
+        dlg.Destroy()
+        
+    def continue_with_text_identification(self):
+        """Continue with text-based speaker identification after token missing dialog."""
+        progress_dialog = wx.ProgressDialog(
+            "Speaker Identification",
+            "Proceeding with text-based analysis...",
+            maximum=100,
+            parent=self,
+            style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE | wx.PD_ELAPSED_TIME
+        )
+        progress_dialog.Update(30)
+        
+        try:
+            # Force text-based identification regardless of PyAnnote availability
+            speakers = self.audio_processor.identify_speakers_simple(self.audio_processor.transcript)
+            
+            wx.CallAfter(progress_dialog.Update, 80, "Creating speaker mapping interface...")
+            
+            # Clear existing mapping UI
+            wx.CallAfter(self.speaker_mapping_sizer.Clear, True)
+            
+            # Create UI for speaker mapping
+            if speakers:
+                wx.CallAfter(self.create_speaker_mapping_ui, speakers)
+                speaker_count = len(set(s["speaker"] for s in speakers))
+                
+                wx.CallAfter(self.update_status, 
+                            f"Speaker identification complete using text analysis. Found {speaker_count} speakers.")
+                
+                wx.CallAfter(progress_dialog.Update, 100, 
+                            f"Found {speaker_count} speakers using text analysis!")
+            else:
+                wx.CallAfter(self.update_status, "No speakers identified.")
+                wx.CallAfter(progress_dialog.Update, 100, "No speakers were identified in the transcript.")
+                
+        except Exception as e:
+            wx.CallAfter(progress_dialog.Destroy)
+            wx.CallAfter(wx.MessageBox, f"Speaker identification error: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
+        finally:
+            wx.CallAfter(self.identify_speakers_btn.Enable)
+
     def create_speaker_mapping_ui(self, speakers):
         """Create UI for speaker name mapping."""
         speaker_ids = set()
@@ -1505,6 +1891,22 @@ class MainFrame(wx.Frame):
         # Update transcript display
         self.transcript_text.SetValue("")  # Clear first to reset styling
         
+        # Check which method was used for speaker identification
+        using_diarization = hasattr(self.audio_processor, 'diarization') and self.audio_processor.diarization
+        
+        # Add a header indicating which method was used
+        if using_diarization:
+            method_text = "Speaker identification performed using audio voice analysis (PyAnnote)"
+            method_color = wx.Colour(0, 128, 0)  # Green for audio-based
+        else:
+            method_text = "Speaker identification performed using text pattern analysis"
+            method_color = wx.Colour(128, 0, 0)  # Red for text-based
+            
+        # Add the method header with appropriate styling
+        self.transcript_text.SetDefaultStyle(wx.TextAttr(method_color, wx.NullColour, 
+                                            wx.Font(9, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_ITALIC, wx.FONTWEIGHT_NORMAL)))
+        self.transcript_text.AppendText(method_text + "\n\n")
+        
         # Add each speaker segment with styling
         lines = updated_transcript.split("\n\n")
         for i, line in enumerate(lines):
@@ -1528,7 +1930,8 @@ class MainFrame(wx.Frame):
                 self.transcript_text.AppendText("\n\n")
                 
         if event is not None:  # Only show status message if called directly
-            self.update_status("Speaker names applied to transcript.")
+            method_description = "audio diarization" if using_diarization else "text analysis"
+            self.update_status(f"Speaker names applied to transcript using {method_description}.")
         
     def on_summarize(self, event):
         """Generate a summary of the transcript."""
@@ -1795,6 +2198,135 @@ class MainFrame(wx.Frame):
             return True
         except (subprocess.SubprocessError, FileNotFoundError):
             return False
+
+    def check_pyannote(self):
+        """Check if PyAnnote is available and show installation instructions if not."""
+        if not PYANNOTE_AVAILABLE:
+            dlg = wx.MessageDialog(
+                self,
+                "PyAnnote is not installed. PyAnnote provides more accurate speaker diarization "
+                "by analyzing audio directly, rather than just text.\n\n"
+                "To install PyAnnote and set it up, click 'Yes' for detailed instructions.",
+                "Speaker Diarization Enhancement",
+                wx.YES_NO | wx.ICON_INFORMATION
+            )
+            if dlg.ShowModal() == wx.ID_YES:
+                self.show_pyannote_setup_guide()
+            dlg.Destroy()
+    
+    def show_pyannote_setup_guide(self):
+        """Show detailed setup instructions for PyAnnote."""
+        dlg = wx.Dialog(self, title="PyAnnote Setup Guide", size=(650, 550))
+        
+        panel = wx.Panel(dlg)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Create a styled text control for better formatting
+        text = wx.TextCtrl(
+            panel, 
+            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2,
+            size=(-1, 400)
+        )
+        
+        # Set up the instructions
+        guide = """PYANNOTE SETUP GUIDE
+
+Step 1: Install Required Dependencies
+--------------------------------------
+Run the following commands in your terminal:
+
+pip install torch torchaudio
+pip install pyannote.audio
+
+Step 2: Get HuggingFace Access Token
+------------------------------------
+1. Create a HuggingFace account at https://huggingface.co/join
+2. Go to https://huggingface.co/pyannote/speaker-diarization
+3. Accept the user agreement
+4. Go to https://huggingface.co/settings/tokens
+5. Create a new token with READ access
+6. Copy the token
+
+Step 3: Configure the Application
+--------------------------------
+1. After installing, restart this application
+2. Go to the Settings tab
+3. Paste your token in the "PyAnnote Speaker Diarization" section
+4. Click "Save Token"
+5. Return to the Audio Processing tab
+6. Click "Identify Speakers" to use audio-based speaker identification
+
+Important Notes:
+---------------
+• PyAnnote requires at least 4GB of RAM
+• GPU acceleration (if available) will make processing much faster
+• For best results, use high-quality audio with minimal background noise
+• The first run may take longer as models are downloaded
+
+Troubleshooting:
+---------------
+• If you get CUDA errors, try installing a compatible PyTorch version for your GPU
+• If you get "Access Denied" errors, check that your token is valid and you've accepted the license agreement
+• For long audio files (>10 min), processing may take several minutes
+"""
+        
+        # Add the text with some styling
+        text.SetValue(guide)
+        
+        # Style the headers
+        text.SetStyle(0, 19, wx.TextAttr(wx.BLUE, wx.NullColour, wx.Font(14, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)))
+        
+        # Find all the section headers and style them
+        for section in ["Step 1:", "Step 2:", "Step 3:", "Important Notes:", "Troubleshooting:"]:
+            start = guide.find(section)
+            if start != -1:
+                end = start + len(section)
+                text.SetStyle(start, end, wx.TextAttr(wx.Colour(128, 0, 128), wx.NullColour, wx.Font(12, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)))
+        
+        # Add to sizer
+        sizer.Add(text, 1, wx.EXPAND | wx.ALL, 10)
+        
+        # Add buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        
+        # Add a button to copy installation commands
+        copy_btn = wx.Button(panel, label="Copy Installation Commands")
+        copy_btn.Bind(wx.EVT_BUTTON, lambda e: self.copy_to_clipboard("pip install torch torchaudio\npip install pyannote.audio"))
+        btn_sizer.Add(copy_btn, 0, wx.RIGHT, 10)
+        
+        # Add a button to open HuggingFace token page
+        hf_btn = wx.Button(panel, label="Open HuggingFace Token Page")
+        hf_btn.Bind(wx.EVT_BUTTON, lambda e: wx.LaunchDefaultBrowser("https://huggingface.co/settings/tokens"))
+        btn_sizer.Add(hf_btn, 0, wx.RIGHT, 10)
+        
+        # Add button to go to settings tab
+        settings_btn = wx.Button(panel, label="Go to Settings Tab")
+        settings_btn.Bind(wx.EVT_BUTTON, lambda e: (self.notebook.SetSelection(2), dlg.EndModal(wx.ID_CLOSE)))
+        btn_sizer.Add(settings_btn, 0, wx.RIGHT, 10)
+        
+        # Add close button
+        close_btn = wx.Button(panel, wx.ID_CLOSE)
+        close_btn.Bind(wx.EVT_BUTTON, lambda e: dlg.EndModal(wx.ID_CLOSE))
+        btn_sizer.Add(close_btn, 0)
+        
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10)
+        
+        panel.SetSizer(sizer)
+        dlg.ShowModal()
+        dlg.Destroy()
+    
+    def copy_to_clipboard(self, text):
+        """Copy text to clipboard."""
+        if wx.TheClipboard.Open():
+            wx.TheClipboard.SetData(wx.TextDataObject(text))
+            wx.TheClipboard.Close()
+            wx.MessageBox("Commands copied to clipboard", "Copied", wx.OK | wx.ICON_INFORMATION)
+
+    def on_save_pyannote_token(self, event):
+        """Save the PyAnnote token."""
+        token = self.pyannote_token_input.GetValue()
+        self.config_manager.set_pyannote_token(token)
+        wx.MessageBox("PyAnnote token saved successfully.", "Success", wx.OK | wx.ICON_INFORMATION)
 
 # Main Application Class
 class AudioApp(wx.App):
