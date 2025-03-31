@@ -17,6 +17,11 @@ import io
 import subprocess
 import wave
 import numpy as np
+import librosa
+import soundfile as sf
+from pyannote.core import Segment, Annotation
+import concurrent.futures
+from threading import Lock
 
 # Check if pydub is available for audio conversion
 try:
@@ -144,9 +149,10 @@ class AudioProcessor:
         self.speaker_segments = []  # Stores time-aligned speaker segments
         self.diarization = None  # Will store pyannote diarization results
         
-    def update_status(self, message):
+    def update_status(self, message, percent=None):
+        """Update the status with an optional progress percentage."""
         if self.update_callback:
-            wx.CallAfter(self.update_callback, message)
+            self.update_callback(message, percent)
             
     def validate_audio_file(self, file_path):
         """Validate that the audio file is suitable for transcription."""
@@ -175,80 +181,42 @@ class AudioProcessor:
         return True
             
     def convert_to_wav(self, file_path):
-        """Convert audio file to WAV format for better compatibility."""
-        self.update_status(f"Converting {os.path.basename(file_path)} to WAV format...")
+        """Convert audio file to WAV format for processing with PyAnnote."""
+        output_path = os.path.splitext(file_path)[0] + "_converted.wav"
         
-        # Get file extension
-        file_ext = os.path.splitext(file_path)[1].lower()
+        self.update_status(f"Converting {os.path.basename(file_path)} to WAV format...", percent=0.1)
         
-        # If already WAV, just return the original file
-        if file_ext == '.wav':
-            return file_path
-            
-        # Create a temporary WAV file
-        temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-        temp_wav.close()
-        
-        try:
-            if PYDUB_AVAILABLE:
-                try:
-                    # Use pydub for conversion
-                    if file_ext == '.mp3':
-                        audio = AudioSegment.from_mp3(file_path)
-                    elif file_ext == '.m4a':
-                        audio = AudioSegment.from_file(file_path, format="m4a")
-                    else:
-                        audio = AudioSegment.from_file(file_path)
-                    
-                    audio.export(temp_wav.name, format="wav")
-                    self.update_status("Conversion complete using pydub.")
-                    return temp_wav.name
-                except FileNotFoundError as e:
-                    # This usually means ffmpeg/ffprobe is not installed or not in PATH
-                    if "ffprobe" in str(e) or "ffmpeg" in str(e):
-                        self.update_status("Pydub requires FFmpeg to be installed. Trying direct FFmpeg...")
-                        # Fall through to the FFmpeg method
-                    else:
-                        raise
-            
-            # Fallback to direct ffmpeg if installed
+        # Try using pydub if available (handles more formats)
+        if PYDUB_AVAILABLE:
             try:
-                # Check if ffmpeg is available
-                subprocess.run(["ffmpeg", "-version"], 
-                              stdout=subprocess.PIPE, 
-                              stderr=subprocess.PIPE, 
-                              check=True)
-                
-                # Convert using ffmpeg
-                self.update_status("Converting with FFmpeg...")
-                subprocess.run([
-                    "ffmpeg", 
-                    "-i", file_path, 
-                    "-ar", "16000",  # Whisper works best with 16kHz
-                    "-ac", "1",      # Mono channel
-                    "-c:a", "pcm_s16le",  # 16-bit PCM
-                    "-y",            # Overwrite output file
-                    temp_wav.name
-                ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-                
-                self.update_status("Conversion complete using FFmpeg.")
-                return temp_wav.name
-                
-            except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                # If ffmpeg failed or is not available
-                install_instructions = self._get_ffmpeg_install_instructions()
-                error_msg = (
-                    f"Could not convert audio file: FFmpeg/FFprobe is not installed or not in your PATH. "
-                    f"\n\nTo install FFmpeg: {install_instructions}"
-                )
-                raise ValueError(error_msg)
-                    
-        except Exception as e:
-            # Clean up on error
-            if os.path.exists(temp_wav.name):
-                os.unlink(temp_wav.name)
-            raise ValueError(f"Error converting audio file: {str(e)}")
-    
+                audio = AudioSegment.from_file(file_path)
+                audio.export(output_path, format="wav")
+                self.update_status("Conversion complete using pydub.", percent=1.0)
+                return output_path
+            except Exception as e:
+                # Fallback to FFmpeg if pydub fails
+                self.update_status("Pydub requires FFmpeg to be installed. Trying direct FFmpeg...", percent=0.2)
+        
+        # Direct FFmpeg conversion
+        if not self._is_ffmpeg_available():
+            install_instructions = self._get_ffmpeg_install_instructions()
+            raise ValueError(f"FFmpeg is required for audio conversion but not found. Please install it.\n\n{install_instructions}")
+        
+        # Proceed with FFmpeg conversion
+        self.update_status("Converting with FFmpeg...", percent=0.5)
+        try:
+            subprocess.run([
+                'ffmpeg', '-y', '-i', file_path, 
+                '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                output_path
+            ], check=True, stderr=subprocess.PIPE)
+            
+            self.update_status("Conversion complete using FFmpeg.", percent=1.0)
+            return output_path
+            
+        except subprocess.CalledProcessError as e:
+            raise ValueError(f"FFmpeg conversion failed: {e.stderr.decode() if e.stderr else str(e)}")
+            
     def _get_ffmpeg_install_instructions(self):
         """Return platform-specific instructions for installing FFmpeg."""
         if sys.platform == 'darwin':  # macOS
@@ -259,91 +227,87 @@ class AudioProcessor:
             return "sudo apt install ffmpeg  (Debian/Ubuntu) or sudo yum install ffmpeg (Fedora/CentOS)"
             
     def transcribe_audio(self, file_path, language="en"):
-        """Transcribe audio file using OpenAI Whisper API."""
-        converted_file = None
+        """Transcribe audio using OpenAI Whisper API."""
+        # Validate the audio file
+        self.validate_audio_file(file_path)
+        
+        # Store the file path for potential diarization later
+        self.audio_file_path = file_path
+        
+        # Get file info for status updates
+        file_ext = os.path.splitext(file_path)[1].lower()
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        
+        # Update status with file info
+        self.update_status(f"Processing {os.path.basename(file_path)} ({file_ext} format, {file_size_mb:.2f}MB)", percent=0.1)
+        
+        # Start transcription
+        self.update_status(f"Transcribing audio file: {os.path.basename(file_path)}", percent=0.2)
         
         try:
-            # Save the audio file path for later diarization
-            self.audio_file_path = file_path
-            
-            # Validate the audio file
-            self.validate_audio_file(file_path)
-            
-            # Get file extension
-            file_ext = os.path.splitext(file_path)[1].lower()
-            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            self.update_status(f"Processing {os.path.basename(file_path)} ({file_ext} format, {file_size_mb:.2f}MB)")
-            
-            # For m4a files, we'll directly pass the file without using temporary files
-            # as the API supports m4a natively
-            self.update_status(f"Transcribing audio file: {os.path.basename(file_path)}")
-            
-            # Open the file directly - no need for temporary files or conversion for supported formats
-            try:
-                with open(file_path, "rb") as audio_file:
-                    self.update_status("Sending file to OpenAI Whisper API...")
+            # Open the file and send to API
+            with open(file_path, "rb") as audio_file:
+                self.update_status("Sending file to OpenAI Whisper API...", percent=0.3)
+                
+                try:
+                    # First try direct transcription
                     response = self.client.audio.transcriptions.create(
                         model=WHISPER_MODEL,
                         file=audio_file,
-                        response_format="verbose_json",
                         language=language,
-                        timestamp_granularities=["word"]
+                        response_format="verbose_json"
                     )
-            except openai.BadRequestError as e:
-                if "Invalid file format" in str(e) and file_ext == '.m4a':
-                    # Special handling for m4a files that sometimes have compatibility issues
-                    self.update_status("M4A format issue detected. Trying with conversion...")
-                    
-                    # Try to convert to wav as a fallback
-                    if PYDUB_AVAILABLE or self._is_ffmpeg_available():
+                except Exception as e:
+                    error_msg = str(e)
+                    # Handle M4A format issues by converting first
+                    if file_ext == '.m4a' and ("Invalid file format" in error_msg or "ffprobe" in error_msg):
+                        self.update_status("M4A format issue detected. Trying with conversion...", percent=0.4)
                         converted_file = self.convert_to_wav(file_path)
-                        with open(converted_file, "rb") as audio_file:
-                            self.update_status("Sending converted file to OpenAI Whisper API...")
+                        
+                        with open(converted_file, "rb") as converted_audio:
+                            self.update_status("Sending converted file to OpenAI Whisper API...", percent=0.5)
                             response = self.client.audio.transcriptions.create(
                                 model=WHISPER_MODEL,
-                                file=audio_file,
-                                response_format="verbose_json",
+                                file=converted_audio,
                                 language=language,
-                                timestamp_granularities=["word"]
+                                response_format="verbose_json"
                             )
+                            
+                        # Clean up converted file
+                        if os.path.exists(converted_file):
+                            os.unlink(converted_file)
                     else:
-                        # If conversion tools aren't available, raise a more helpful error
-                        raise ValueError(
-                            "This M4A file has compatibility issues with the OpenAI API. "
-                            "Please install pydub (pip install pydub) or ffmpeg for automatic conversion, "
-                            "or convert it manually to WAV format before uploading."
-                        )
-                else:
-                    # Re-raise if it's not an m4a format issue
-                    raise
-                
-            self.transcript = response.text
-            self.word_by_word = response.words
+                        # For other errors, re-raise
+                        raise
+                    
+            # Extract transcript text
+            transcript_text = response.text
             
-            # Save raw transcript
-            transcript_filename = f"Transcripts/transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            with open(transcript_filename, 'w') as f:
-                f.write(json.dumps(response.model_dump(), indent=2))
-                
-            self.update_status("Transcription complete.")
-            return response
+            # Store word-by-word data for potential diarization
+            if hasattr(response, "words"):
+                self.word_by_word = response.words
             
-        except openai.APIError as e:
-            error_msg = f"OpenAI API Error: {str(e)}"
-            self.update_status(error_msg)
+            # Save transcript to file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"Transcripts/transcript_{timestamp}.txt"
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(transcript_text)
+            
+            # Store transcript for later use
+            self.transcript = transcript_text
+            
+            self.update_status("Transcription complete.", percent=1.0)
+            return transcript_text
+            
+        except openai.AuthenticationError:
+            error_msg = "Authentication error. Please check your OpenAI API key."
+            self.update_status(error_msg, percent=0)
             raise ValueError(error_msg)
         except Exception as e:
-            error_msg = f"Error during transcription: {str(e)}"
-            self.update_status(error_msg)
+            error_msg = f"Transcription error: {str(e)}"
+            self.update_status(error_msg, percent=0)
             raise
-        finally:
-            # Clean up converted file if it was created
-            if converted_file and os.path.exists(converted_file):
-                try:
-                    os.unlink(converted_file)
-                except:
-                    pass
-                    
+            
     def _is_ffmpeg_available(self):
         """Check if ffmpeg is available on the system."""
         try:
@@ -358,15 +322,20 @@ class AudioProcessor:
             return False
             
     def identify_speakers(self, transcript):
-        """Use OpenAI to identify different speakers in the transcript."""
-        self.update_status("Identifying speakers...")
+        """Use optimized methods to identify different speakers in the transcript."""
+        self.update_status("Identifying speakers...", percent=0.05)
+        
+        # Fast path: For very long transcripts without audio, use text-only analysis
+        if len(transcript) > 20000 and (not hasattr(self, 'audio_file_path') or not self.audio_file_path):
+            self.update_status("Long transcript detected without audio. Using optimized text-only analysis...", percent=0.1)
+            return self.identify_speakers_simple(transcript)
         
         # Check if we have the audio file and PyAnnote is available
         if hasattr(self, 'audio_file_path') and self.audio_file_path and PYANNOTE_AVAILABLE:
             try:
                 return self.identify_speakers_with_diarization(self.audio_file_path, transcript)
             except Exception as e:
-                self.update_status(f"Diarization error: {str(e)}. Falling back to text-based analysis.")
+                self.update_status(f"Diarization error: {str(e)}. Falling back to text-based analysis.", percent=0.1)
                 return self.identify_speakers_simple(transcript)
         else:
             # Fall back to text-based approach
@@ -374,11 +343,11 @@ class AudioProcessor:
     
     def identify_speakers_with_diarization(self, audio_file_path, transcript):
         """Identify speakers using audio diarization with PyAnnote."""
-        self.update_status("Performing audio diarization analysis...")
+        self.update_status("Performing audio diarization analysis...", percent=0.05)
         
         # Check if PyAnnote is available
         if not PYANNOTE_AVAILABLE:
-            self.update_status("PyAnnote not available. Install with: pip install pyannote.audio")
+            self.update_status("PyAnnote not available. Install with: pip install pyannote.audio", percent=0)
             return self.identify_speakers_simple(transcript)
         
         # Step 1: Initialize PyAnnote pipeline
@@ -399,10 +368,10 @@ class AudioProcessor:
             
             # If still no token, show message and fall back to text-based identification
             if not token:
-                self.update_status("PyAnnote token not found in settings. Please add your token in the Settings tab.")
+                self.update_status("PyAnnote token not found in settings. Please add your token in the Settings tab.", percent=0)
                 return self.identify_speakers_simple(transcript)
             
-            self.update_status("Initializing diarization pipeline...")
+            self.update_status("Initializing diarization pipeline...", percent=0.1)
             
             # Initialize the PyAnnote pipeline
             pipeline = pyannote.audio.Pipeline.from_pretrained(
@@ -416,278 +385,547 @@ class AudioProcessor:
             
             # Convert the file to WAV format if needed
             if not audio_file_path.lower().endswith('.wav'):
-                self.update_status("Converting audio to WAV format for diarization...")
+                self.update_status("Converting audio to WAV format for diarization...", percent=0.15)
                 converted_file = self.convert_to_wav(audio_file_path)
                 diarization_file = converted_file
             else:
                 diarization_file = audio_file_path
             
-            # Apply diarization
-            self.update_status("Applying diarization to audio file (this may take time for longer files)...")
-            self.diarization = pipeline(diarization_file)
+            # Get audio file information
+            audio_duration = librosa.get_duration(path=diarization_file)
+            self.update_status(f"Audio duration: {audio_duration:.1f} seconds", percent=0.2)
+            
+            # Very short files need very different processing approach
+            is_short_file = audio_duration < 300  # Less than 5 minutes
+            
+            if is_short_file:
+                # Ultra fast mode for short files (5 min or less) - direct processing with optimized parameters
+                self.update_status("Short audio detected, using ultra-fast mode...", percent=0.25)
+                
+                # Use ultra-optimized parameters for short files
+                pipeline.instantiate({
+                    # More aggressive voice activity detection for speed
+                    "segmentation": {
+                        "min_duration_on": 0.25,      # Shorter minimum speech (default 0.1s)
+                        "min_duration_off": 0.25,     # Shorter minimum silence (default 0.1s)
+                    },
+                    # Faster clustering with fewer speakers expected in short clips
+                    "clustering": {
+                        "min_cluster_size": 6,        # Require fewer samples (default 15)
+                        "method": "centroid"          # Faster than "average" linkage
+                    },
+                    # Skip post-processing for speed
+                    "segmentation_batch_size": 32,    # Larger batch for speed
+                    "embedding_batch_size": 32,       # Larger batch for speed
+                })
+                
+                # Apply diarization directly for short files
+                self.update_status("Processing audio (fast mode)...", percent=0.3)
+                self.diarization = pipeline(diarization_file)
+                
+                # For very short files, optimize the diarization results
+                if audio_duration < 60:  # Less than 1 minute
+                    # Further optimize by limiting max speakers for very short clips
+                    num_speakers = len(set(s for _, _, s in self.diarization.itertracks(yield_label=True)))
+                    if num_speakers > 3:
+                        self.update_status("Optimizing speaker count for short clip...", percent=0.7)
+                        # Re-run with max_speakers=3 for very short clips
+                        self.diarization = pipeline(diarization_file, num_speakers=3)
+            else:
+                # Determine chunk size based on audio duration - longer files use chunking
+                if audio_duration > 3600:  # > 1 hour
+                    # For very long recordings, use 5-minute chunks
+                    MAX_CHUNK_DURATION = 300  # 5 minutes per chunk
+                    self.update_status("Very long audio detected (>1 hour). Using optimized chunk size.", percent=0.22)
+                elif audio_duration > 1800:  # > 30 minutes
+                    MAX_CHUNK_DURATION = 450  # 7.5 minutes per chunk
+                    self.update_status("Long audio detected (>30 minutes). Using optimized chunk size.", percent=0.22)
+                else:
+                    # Default 10-minute chunks for shorter files
+                    MAX_CHUNK_DURATION = 600  # 10 minutes per chunk
+                
+                # Process in chunks for longer files
+                self.update_status("Processing in chunks for optimized performance...", percent=0.25)
+                self.diarization = self._process_audio_in_chunks(pipeline, diarization_file, audio_duration, MAX_CHUNK_DURATION)
             
             # Clean up converted file if needed
             if diarization_file != audio_file_path and os.path.exists(diarization_file):
                 os.unlink(diarization_file)
             
             # Now we have diarization data, map it to the transcript using word timestamps
-            return self._map_diarization_to_transcript(transcript)
+            # Use optimized mapping for short files
+            if is_short_file:
+                self.update_status("Fast mapping diarization to transcript...", percent=0.8)
+                return self._fast_map_diarization(transcript)
+            else:
+                return self._map_diarization_to_transcript(transcript)
             
         except Exception as e:
-            self.update_status(f"Error in diarization: {str(e)}")
+            self.update_status(f"Error in diarization: {str(e)}", percent=0)
             # Fall back to text-based approach
             return self.identify_speakers_simple(transcript)
-    
-    def _map_diarization_to_transcript(self, transcript):
-        """Map diarization results to the transcript using word timings."""
-        self.update_status("Mapping diarization results to transcript...")
+
+    def _fast_map_diarization(self, transcript):
+        """Simplified and faster mapping for short files."""
+        self.update_status("Fast mapping diarization results to transcript...", percent=0.85)
         
         if not hasattr(self, 'word_by_word') or not self.word_by_word or not self.diarization:
             return self.identify_speakers_simple(transcript)
         
         try:
-            # Create a speaker mapping dictionary based on diarization
-            speaker_map = {}
-            for turn, _, speaker in self.diarization.itertracks(yield_label=True):
-                start_time = turn.start
-                end_time = turn.end
-                
-                # Map this time segment to a speaker
-                for t in np.arange(start_time, end_time, 0.1):  # Sample every 0.1 seconds
-                    speaker_map[round(t, 1)] = speaker
+            # Create speaker timeline map at higher granularity (every 0.2s)
+            timeline_map = {}
+            speaker_set = set()
             
-            # Split transcript into paragraphs (either use existing paragraphs or create new ones)
+            # Extract all speakers and their time ranges
+            for segment, _, speaker in self.diarization.itertracks(yield_label=True):
+                start_time = segment.start
+                end_time = segment.end
+                speaker_set.add(speaker)
+                
+                # For short files, we can afford fine-grained sampling
+                step = 0.1  # 100ms steps
+                for t in np.arange(start_time, end_time, step):
+                    timeline_map[round(t, 1)] = speaker
+            
+            # Create paragraphs if they don't exist
             if hasattr(self, 'speaker_segments') and self.speaker_segments:
                 paragraphs = self.speaker_segments
             else:
                 paragraphs = self._create_improved_paragraphs(transcript)
                 self.speaker_segments = paragraphs
             
-            # For each word in the transcript, find its speaker
+            # Calculate overall speakers - short clips typically have 1-3 speakers
+            num_speakers = len(speaker_set)
+            self.update_status(f"Detected {num_speakers} speakers in audio", percent=0.9)
+            
+            # Map each word to a speaker
             word_speakers = {}
             for word_info in self.word_by_word:
                 if not hasattr(word_info, "start") or not hasattr(word_info, "end"):
                     continue
                 
-                word_start = word_info.start
-                word_end = word_info.end
-                word = word_info.word
+                # Take the middle point of each word
+                word_time = round((word_info.start + word_info.end) / 2, 1)
                 
-                # Sample time points within the word duration
-                times = np.arange(word_start, word_end, 0.1)
-                if len(times) == 0:
-                    times = [word_start]
-                
-                # Find the most common speaker for this word
-                speakers_for_word = []
-                for t in times:
-                    rounded_t = round(t, 1)
-                    if rounded_t in speaker_map:
-                        speakers_for_word.append(speaker_map[rounded_t])
-                
-                if speakers_for_word:
-                    # Find most common speaker for this word
-                    most_common_speaker = max(set(speakers_for_word), key=speakers_for_word.count)
-                    word_speakers[word] = most_common_speaker
+                # Find closest time in our map
+                closest_time = min(timeline_map.keys(), key=lambda x: abs(x - word_time), default=None)
+                if closest_time is not None and abs(closest_time - word_time) < 1.0:
+                    word_speakers[word_info.word] = timeline_map[closest_time]
             
-            # Now assign speakers to paragraphs based on majority of words
+            # Now assign speakers to paragraphs based on word majority
             self.speakers = []
-            for i, paragraph in enumerate(paragraphs):
+            for paragraph in paragraphs:
                 para_speakers = []
                 
-                # Split paragraph into words
+                # Count speakers in this paragraph
                 words = re.findall(r'\b\w+\b', paragraph.lower())
-                
-                # Count speakers for each word in paragraph
                 for word in words:
                     if word in word_speakers:
                         para_speakers.append(word_speakers[word])
                 
-                # Find the most common speaker for this paragraph
+                # Find most common speaker
                 if para_speakers:
-                    most_common_speaker = max(set(para_speakers), key=para_speakers.count)
-                    # Format as "Speaker X" where X is the speaker ID from diarization
+                    from collections import Counter
+                    speaker_counts = Counter(para_speakers)
+                    most_common_speaker = speaker_counts.most_common(1)[0][0]
                     speaker_id = f"Speaker {most_common_speaker.split('_')[-1]}"
                 else:
-                    # Fallback if no speaker info
-                    speaker_id = f"Speaker {(i % 2) + 1}"
+                    # Fallback for paragraphs with no identified speaker
+                    speaker_id = f"Speaker 1"
                 
                 self.speakers.append({
                     "speaker": speaker_id,
                     "text": paragraph
                 })
             
-            self.update_status(f"Diarization complete. Found {len(set(s['speaker'] for s in self.speakers))} speakers.")
+            # Final quick consistency check for short files
+            if len(self.speakers) > 1:
+                self._quick_consistency_check()
+            
+            self.update_status(f"Diarization complete. Found {num_speakers} speakers.", percent=1.0)
             return self.speakers
             
         except Exception as e:
-            self.update_status(f"Error mapping diarization: {str(e)}")
-            # Fall back to text-based approach if mapping fails
+            self.update_status(f"Error in fast mapping: {str(e)}", percent=0)
             return self.identify_speakers_simple(transcript)
     
-    def identify_speakers_simple(self, transcript):
-        """Identify speakers using a context-enhanced role-based approach."""
-        self.update_status("Analyzing transcript for speaker identification...")
+    def _quick_consistency_check(self):
+        """Ultra-quick consistency check for short files"""
+        if len(self.speakers) < 3:
+            return
+            
+        # Look for isolated speaker segments
+        for i in range(1, len(self.speakers) - 1):
+            prev_speaker = self.speakers[i-1]["speaker"]
+            curr_speaker = self.speakers[i]["speaker"]
+            next_speaker = self.speakers[i+1]["speaker"]
+            
+            # If current speaker is sandwiched between different speakers
+            if prev_speaker == next_speaker and curr_speaker != prev_speaker:
+                # Fix the segment only if very short (likely error)
+                if len(self.speakers[i]["text"].split()) < 15:
+                    self.speakers[i]["speaker"] = prev_speaker
+
+    def _process_audio_in_chunks(self, pipeline, audio_file, total_duration, chunk_size):
+        """Process long audio files in chunks to optimize memory usage and speed."""
+        from pyannote.core import Segment, Annotation
+        import concurrent.futures
+        from threading import Lock
         
-        # First, pre-analyze the transcript to understand speaker identities and roles
+        # Initialize a combined annotation object
+        combined_diarization = Annotation()
+        
+        # Calculate number of chunks
+        num_chunks = int(np.ceil(total_duration / chunk_size))
+        self.update_status(f"Processing audio in {num_chunks} chunks...", percent=0.1)
+        
+        # Optimize number of workers based on file length
+        # More chunks = more workers (up to cpu_count)
+        cpu_count = os.cpu_count() or 4
+        if num_chunks > 10:
+            max_workers = min(8, cpu_count)  # Use up to 8 workers for very long files
+        else:
+            max_workers = min(4, cpu_count)  # Default: use up to 4 workers
+            
+        self.update_status(f"Using {max_workers} parallel workers for processing...", percent=0.12)
+        
+        # Lock for thread-safe updates
+        lock = Lock()
+        result_counter = [0]  # Use a list so we can modify it from the worker
+        
+        # Define a worker function to process a chunk with optimized parameters
+        def process_chunk(chunk_info):
+            i, start_time, end_time = chunk_info
+            chunk_result = Annotation()
+            
+            # Create temporary file for this chunk
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                chunk_path = tmp_file.name
+            
+            try:
+                # Extract chunk using ffmpeg with optimized parameters
+                # -threads 2: Use 2 threads per extraction process
+                # -ac 1: Convert to mono
+                # -ar 16000: Use 16kHz sample rate (sufficient for voice)
+                subprocess.run([
+                    'ffmpeg', '-y', '-loglevel', 'error', '-threads', '2',
+                    '-i', audio_file,
+                    '-ss', str(start_time),
+                    '-to', str(end_time),
+                    '-c:a', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                    chunk_path
+                ], check=True)
+                
+                # Process this chunk
+                chunk_diarization = pipeline(chunk_path)
+                
+                # Adjust timestamps and add to result - only include speakers that talk for >0.5s
+                min_speech_duration = 0.5  # Filter out very short segments
+                
+                for segment, track, speaker in chunk_diarization.itertracks(yield_label=True):
+                    # Skip very short segments (often noise or artifacts)
+                    if segment.duration < min_speech_duration:
+                        continue
+                        
+                    adjusted_start = segment.start + start_time
+                    adjusted_end = segment.end + start_time
+                    adjusted_segment = Segment(adjusted_start, adjusted_end)
+                    chunk_result[adjusted_segment, track] = speaker
+                
+                # Update progress inside lock
+                with lock:
+                    result_counter[0] += 1
+                    progress = (result_counter[0] / num_chunks) * 0.8 + 0.1
+                    self.update_status(f"Processed chunk {result_counter[0]}/{num_chunks} ({start_time:.1f}s to {end_time:.1f}s)...", 
+                                      percent=progress)
+                
+                return chunk_result
+                
+            except Exception as e:
+                self.update_status(f"Error processing chunk {i+1}: {str(e)}", percent=0.1)
+                return Annotation()  # Return empty annotation on error
+            finally:
+                # Clean up temporary file
+                if os.path.exists(chunk_path):
+                    os.unlink(chunk_path)
+        
+        # Create chunk information - include 1-second overlap between chunks
+        chunk_infos = []
+        for i in range(num_chunks):
+            start_time = max(0, i * chunk_size - 1) if i > 0 else 0
+            end_time = min((i + 1) * chunk_size + 1, total_duration) if i < num_chunks - 1 else total_duration
+            chunk_infos.append((i, start_time, end_time))
+        
+        # Process chunks in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all chunks for processing
+            future_to_chunk = {
+                executor.submit(process_chunk, chunk_info): chunk_info 
+                for chunk_info in chunk_infos
+            }
+            
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_chunk):
+                chunk_result = future.result()
+                
+                # Merge chunk result into combined result
+                with lock:
+                    for segment, track, speaker in chunk_result.itertracks(yield_label=True):
+                        combined_diarization[segment, track] = speaker
+        
+        self.update_status(f"Completed processing all {num_chunks} chunks.", percent=0.9)
+        
+        # Clean up the annotation - join nearby segments from the same speaker
+        self.update_status("Post-processing and optimizing results...", percent=0.92)
+        combined_diarization = self._optimize_diarization_results(combined_diarization)
+        
+        return combined_diarization
+        
+    def _optimize_diarization_results(self, diarization):
+        """Optimize diarization results by joining nearby segments from the same speaker."""
+        from pyannote.core import Segment, Annotation
+        
+        # Create a new annotation for the optimized result
+        optimized = Annotation()
+        
+        # Group by speaker
+        for speaker in diarization.labels():
+            speaker_turns = list(diarization.label_timeline(speaker))
+            
+            # Join segments that are close to each other (less than 0.5s gap)
+            max_gap = 0.5
+            i = 0
+            while i < len(speaker_turns):
+                current = speaker_turns[i]
+                j = i + 1
+                while j < len(speaker_turns) and speaker_turns[j].start - speaker_turns[j-1].end <= max_gap:
+                    current = Segment(current.start, speaker_turns[j].end)
+                    j += 1
+                
+                # Add the joined segment to the optimized annotation
+                optimized[current] = speaker
+                i = j
+        
+        return optimized
+    
+    def _identify_speakers_chunked(self, paragraphs, chunk_size):
+        """Process long transcripts in chunks for speaker identification."""
+        self.update_status("Processing transcript in chunks...", percent=0.1)
+        
+        # Group paragraphs into chunks
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        
+        for p in paragraphs:
+            if current_length + len(p) > chunk_size and current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = [p]
+                current_length = len(p)
+            else:
+                current_chunk.append(p)
+                current_length += len(p)
+                
+        # Add the last chunk
+        if current_chunk:
+            chunks.append(current_chunk)
+            
+        self.update_status(f"Processing transcript in {len(chunks)} chunks...", percent=0.15)
+        
+        # Process first chunk to establish speaker patterns
         model_to_use = DEFAULT_OPENAI_MODEL
         
-        # Step 1: Pre-analyze to find explicit speaker identities in the transcript
-        pre_analysis_prompt = f"""
-        Analyze this transcript and identify if there are any EXPLICIT mentions of speaker names or roles.
-        Examples: "My name is John", "This is Dr. Smith speaking", "As the interviewer, I'd like to ask...", etc.
+        # Initialize result container
+        all_results = []
+        speaker_characteristics = {}
         
-        Return ONLY the names/roles you find with high confidence, with the exact quote that identifies them.
-        Format as JSON:
-        {{
-            "explicit_speakers": [
-                {{"name": "John", "role": "interviewee", "evidence": "My name is John and I'm here to discuss..."}},
-                {{"name": "Dr. Smith", "role": "expert", "evidence": "As Dr. Smith, I can tell you that..."}}
-            ]
-        }}
-        
-        If no explicit identities are found, return an empty array.
-        
-        Transcript:
-        {transcript}
-        """
-        
-        try:
-            # Get any explicit speaker identities first
-            explicit_identity_response = self.client.chat.completions.create(
-                model=model_to_use,
-                messages=[
-                    {"role": "system", "content": "You are an expert at identifying explicit speaker identities in transcripts."},
-                    {"role": "user", "content": pre_analysis_prompt}
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"}
-            )
+        # Process each chunk
+        for i, chunk in enumerate(chunks):
+            # Calculate progress percentage (0-1)
+            progress = (i / len(chunks)) * 0.7 + 0.2  # 20% to 90% of total progress
             
-            identity_data = json.loads(explicit_identity_response.choices[0].message.content)
-            explicit_speakers = identity_data.get("explicit_speakers", [])
+            self.update_status(f"Processing chunk {i+1}/{len(chunks)}...", percent=progress)
             
-            # Step 2: Perform comprehensive role analysis
-            role_analysis_prompt = f"""
-            Analyze this transcript and determine the conversation structure and speaker roles.
-            
-            Conversation Analysis:
-            1. What type of conversation is this? (interview, consultation, lecture, debate, casual conversation)
-            2. How many distinct speakers are there? (must be exactly 2)
-            3. What's the relationship dynamic? (expert/novice, interviewer/interviewee, colleagues, friends)
-            
-            For each speaker, analyze:
-            - Linguistic patterns (formal/informal, technical/casual language, sentence length)
-            - Question patterns (who asks more questions? what types of questions?)
-            - Topic knowledge (who demonstrates more expertise on topics discussed?)
-            - Speech patterns (hesitations, fillers, interruptions)
-            
-            Explicit identities found: {json.dumps(explicit_speakers)}
-            
-            Format your response as:
-            {{
-                "conversation_type": "type",
-                "relationship_dynamic": "primary dynamic",
-                "speaker_a": {{
-                    "role": "primary role",
-                    "name": "name if found in explicit_speakers, otherwise 'Speaker A'",
-                    "characteristics": ["uses technical terms", "asks clarifying questions", etc],
-                    "speech_patterns": ["short sentences", "formal language", etc],
-                    "knowledge_areas": ["shows expertise in X", "familiar with Y"],
-                    "question_style": "description of questioning style"
-                }},
-                "speaker_b": {{
-                    "role": "primary role",
-                    "name": "name if found in explicit_speakers, otherwise 'Speaker B'",
-                    "characteristics": ["uses casual language", "shares personal stories", etc],
-                    "speech_patterns": ["long explanations", "uses analogies", etc],
-                    "knowledge_areas": ["knowledgeable about Z", "asks about W"],
-                    "question_style": "description of questioning style"
-                }}
-            }}
-            
-            Transcript:
-            {transcript}
-            """
-            
-            # Get detailed role analysis
-            role_response = self.client.chat.completions.create(
-                model=model_to_use,
-                messages=[
-                    {"role": "system", "content": "You are an expert conversation analyst who can identify speaker roles and communication patterns in transcripts."},
-                    {"role": "user", "content": role_analysis_prompt}
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"}
-            )
-            
-            role_analysis = json.loads(role_response.choices[0].message.content)
-            
-            # Split transcript into paragraphs for speaker assignment
-            paragraphs = self._create_improved_paragraphs(transcript)
-            
-            # Step 3: Assign speakers with context awareness
-            speaker_assignment_prompt = f"""
-            You are analyzing a conversation between two speakers with the following profiles:
-            
-            Speaker A: {json.dumps(role_analysis.get('speaker_a', {}), indent=2)}
-            
-            Speaker B: {json.dumps(role_analysis.get('speaker_b', {}), indent=2)}
-            
-            Conversation type: {role_analysis.get('conversation_type', 'conversation')}
-            Relationship: {role_analysis.get('relationship_dynamic', 'two speakers')}
-            
-            ASSIGNMENT RULES:
-            1. Each paragraph must be assigned to EXACTLY ONE speaker (A or B)
-            2. Questions are typically answered by the OTHER speaker
-            3. First-person statements must be consistent (e.g., "I believe" statements from same speaker)
-            4. Personal experiences must be attributed consistently
-            5. Technical explanations typically come from the expert/knowledgeable role
-            6. Look for linguistic patterns that match each speaker's profile
-            7. The conversation should flow naturally with back-and-forth exchanges
-            
-            Here are the paragraphs to analyze:
-            {json.dumps([{"id": i, "text": p} for i, p in enumerate(paragraphs)], indent=2)}
-            
-            For each paragraph, determine:
-            1. Which speaker's language patterns it matches
-            2. Whether it's a question or response to previous content
-            3. Whether it continues a previous thought or starts a new one
-            4. How it fits into the conversation flow
-            
-            Format your response EXACTLY as follows:
-            [
+            # For first chunk, get detailed analysis
+            if i == 0:
+                prompt = f"""
+                Analyze this transcript segment and identify exactly two speakers (A and B).
+                
+                TASK:
+                1. Determine which paragraphs belong to which speaker
+                2. Identify each speaker's characteristics and speaking style
+                3. Ensure logical conversation flow
+                
+                Return JSON in this exact format:
                 {{
-                    "id": 0,
-                    "speaker": "A or B",
-                    "text": "paragraph text",
-                    "reasoning": "brief explanation of assignment decision"
+                    "analysis": {{
+                        "speaker_a_characteristics": ["characteristic 1", "characteristic 2"],
+                        "speaker_b_characteristics": ["characteristic 1", "characteristic 2"]
+                    }},
+                    "paragraphs": [
+                        {{
+                            "id": {len(all_results)},
+                            "speaker": "A",
+                            "text": "paragraph text"
+                        }},
+                        ...
+                    ]
                 }}
-            ]
-            """
+                
+                Transcript paragraphs:
+                {json.dumps([{"id": len(all_results) + j, "text": p} for j, p in enumerate(chunk)])}
+                """
+            else:
+                # For subsequent chunks, use characteristics from first analysis
+                prompt = f"""
+                Continue assigning speakers to this transcript segment.
+                
+                Speaker A characteristics: {json.dumps(speaker_characteristics.get("speaker_a_characteristics", []))}
+                Speaker B characteristics: {json.dumps(speaker_characteristics.get("speaker_b_characteristics", []))}
+                
+                Return JSON with speaker assignments:
+                {{
+                    "paragraphs": [
+                        {{
+                            "id": {len(all_results)},
+                            "speaker": "A or B",
+                            "text": "paragraph text"
+                        }},
+                        ...
+                    ]
+                }}
+                
+                Transcript paragraphs:
+                {json.dumps([{"id": len(all_results) + j, "text": p} for j, p in enumerate(chunk)])}
+                """
             
-            # Assign speakers to paragraphs
-            assignment_response = self.client.chat.completions.create(
+            # Make API call for this chunk
+            response = self.client.chat.completions.create(
                 model=model_to_use,
                 messages=[
                     {"role": "system", "content": "You are an expert conversation analyst who identifies speaker turns in transcripts with high accuracy."},
-                    {"role": "user", "content": speaker_assignment_prompt}
+                    {"role": "user", "content": prompt}
                 ],
                 temperature=0.0,
                 response_format={"type": "json_object"}
             )
             
-            assignments = json.loads(assignment_response.choices[0].message.content)
+            result = json.loads(response.choices[0].message.content)
             
-            # Process the results
-            if isinstance(assignments, dict) and "paragraphs" in assignments:
-                assignments = assignments["paragraphs"]
-            elif not isinstance(assignments, list):
-                # Try to extract a list if nested
-                for key, value in assignments.items():
-                    if isinstance(value, list) and len(value) > 0:
-                        assignments = value
-                        break
+            # Save speaker characteristics from first chunk
+            if i == 0 and "analysis" in result:
+                speaker_characteristics = result["analysis"]
+            
+            # Add results from this chunk
+            if "paragraphs" in result:
+                all_results.extend(result["paragraphs"])
+            
+            # Update progress
+            after_progress = (i + 0.5) / len(chunks) * 0.7 + 0.2
+            self.update_status(f"Processed chunk {i+1}/{len(chunks)}...", percent=after_progress)
+        
+        # Map Speaker A/B to Speaker 1/2
+        speaker_map = {
+            "A": "Speaker 1", 
+            "B": "Speaker 2",
+            "Speaker A": "Speaker 1", 
+            "Speaker B": "Speaker 2"
+        }
+        
+        self.update_status("Finalizing speaker assignments...", percent=0.95)
+        
+        # Create final speakers list
+        self.speakers = []
+        for item in sorted(all_results, key=lambda x: x.get("id", 0)):
+            speaker_label = item.get("speaker", "Unknown")
+            mapped_speaker = speaker_map.get(speaker_label, speaker_label)
+            
+            self.speakers.append({
+                "speaker": mapped_speaker,
+                "text": item.get("text", "")
+            })
+        
+        # Ensure we have the right number of paragraphs
+        if len(self.speakers) != len(paragraphs):
+            self.update_status(f"Warning: Received {len(self.speakers)} segments but expected {len(paragraphs)}. Fixing...", percent=0.98)
+            self.speakers = [
+                {"speaker": self.speakers[min(i, len(self.speakers)-1)]["speaker"] if self.speakers else f"Speaker {i % 2 + 1}", 
+                 "text": p}
+                for i, p in enumerate(paragraphs)
+            ]
+        
+        self.update_status(f"Speaker identification complete. Found 2 speakers across {len(chunks)} chunks.", percent=1.0)
+        return self.speakers
+
+    def identify_speakers_simple(self, transcript):
+        """Identify speakers using a simplified and optimized approach."""
+        self.update_status("Analyzing transcript for speaker identification...", percent=0.1)
+        
+        # First, split transcript into paragraphs
+        paragraphs = self._create_improved_paragraphs(transcript)
+        self.speaker_segments = paragraphs
+        
+        # Setup model
+        model_to_use = DEFAULT_OPENAI_MODEL
+        
+        # For very long transcripts, we'll analyze in chunks
+        MAX_CHUNK_SIZE = 8000  # characters per chunk
+        
+        if len(transcript) > MAX_CHUNK_SIZE:
+            self.update_status("Long transcript detected. Processing in chunks...", percent=0.15)
+            return self._identify_speakers_chunked(paragraphs, MAX_CHUNK_SIZE)
+        
+        # Enhanced single-pass approach for shorter transcripts
+        prompt = f"""
+        Analyze this transcript and identify exactly two speakers (A and B).
+        
+        TASK:
+        1. Determine which paragraphs belong to which speaker
+        2. Focus on conversation pattern and speaking style
+        3. Ensure logical conversation flow (e.g., questions are followed by answers)
+        4. Maintain consistency in first-person statements
+        
+        Return JSON in this exact format:
+        {{
+            "analysis": {{
+                "speaker_a_characteristics": ["characteristic 1", "characteristic 2"],
+                "speaker_b_characteristics": ["characteristic 1", "characteristic 2"],
+                "speaker_count": 2,
+                "conversation_type": "interview/discussion/etc"
+            }},
+            "paragraphs": [
+                {{
+                    "id": 0,
+                    "speaker": "A",
+                    "text": "paragraph text"
+                }},
+                ...
+            ]
+        }}
+        
+        Transcript paragraphs:
+        {json.dumps([{"id": i, "text": p} for i, p in enumerate(paragraphs)])}
+        """
+        
+        try:
+            # Single API call to assign speakers
+            self.update_status("Sending transcript for speaker analysis...", percent=0.3)
+            response = self.client.chat.completions.create(
+                model=model_to_use,
+                messages=[
+                    {"role": "system", "content": "You are an expert conversation analyst who identifies speaker turns in transcripts with high accuracy."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
+            
+            self.update_status("Processing speaker identification results...", percent=0.7)
+            result = json.loads(response.choices[0].message.content)
+            
+            # Get paragraph assignments
+            assignments = result.get("paragraphs", [])
             
             # Map Speaker A/B to Speaker 1/2 for compatibility with existing system
             speaker_map = {
@@ -701,47 +939,34 @@ class AudioProcessor:
             self.speakers = []
             for item in sorted(assignments, key=lambda x: x.get("id", 0)):
                 speaker_label = item.get("speaker", "Unknown")
-                # Map "A" -> "Speaker 1" and "B" -> "Speaker 2"
                 mapped_speaker = speaker_map.get(speaker_label, speaker_label)
                 
                 self.speakers.append({
                     "speaker": mapped_speaker,
-                    "text": item.get("text", ""),
-                    "reasoning": item.get("reasoning", "")
+                    "text": item.get("text", "")
                 })
             
             # Ensure we have the right number of paragraphs
             if len(self.speakers) != len(paragraphs):
-                self.update_status(f"Warning: Received {len(self.speakers)} segments but expected {len(paragraphs)}. Fixing...")
+                self.update_status(f"Warning: Received {len(self.speakers)} segments but expected {len(paragraphs)}. Fixing...", percent=0.9)
                 self.speakers = [
                     {"speaker": self.speakers[min(i, len(self.speakers)-1)]["speaker"] if self.speakers else f"Speaker {i % 2 + 1}", 
                      "text": p}
                     for i, p in enumerate(paragraphs)
                 ]
             
-            # Store the speaker segments for future reference
-            self.speaker_segments = paragraphs
-            
-            # Apply enhanced role-based fixes
-            self._apply_enhanced_role_fixes(role_analysis)
-            
-            # Apply deep consistency check
-            self._apply_deep_consistency_check(role_analysis)
-            
-            self.update_status(f"Speaker identification complete using context-enhanced analysis.")
+            self.update_status(f"Speaker identification complete. Found {2} speakers.", percent=1.0)
             return self.speakers
             
         except Exception as e:
-            self.update_status(f"Error in speaker identification: {str(e)}")
+            self.update_status(f"Error in speaker identification: {str(e)}", percent=0)
             # Fallback to basic alternating speaker assignment
-            paragraphs = self._create_improved_paragraphs(transcript)
             self.speakers = [
                 {"speaker": f"Speaker {i % 2 + 1}", "text": p}
                 for i, p in enumerate(paragraphs)
             ]
-            self.speaker_segments = paragraphs
             return self.speakers
-    
+            
     def _create_improved_paragraphs(self, transcript):
         """Create more intelligent paragraph breaks based on semantic analysis."""
         import re
@@ -813,150 +1038,23 @@ class AudioProcessor:
             paragraphs.append(' '.join(current_para))
         
         return paragraphs
-        
-    def _apply_enhanced_role_fixes(self, role_analysis):
-        """Apply enhanced fixes based on speaker roles and conversation analysis."""
-        if len(self.speakers) < 3:
-            return
-        
-        # Extract data from role analysis
-        speaker_a_data = role_analysis.get('speaker_a', {})
-        speaker_b_data = role_analysis.get('speaker_b', {})
-        
-        # Map Speaker A/B to Speaker 1/2
-        speaker_map = {"A": "Speaker 1", "B": "Speaker 2", "Speaker A": "Speaker 1", "Speaker B": "Speaker 2"}
-        speaker_a_id = speaker_map.get("A", "Speaker 1")
-        speaker_b_id = speaker_map.get("B", "Speaker 2")
-        
-        # 1. Question-Answer Enforcement
-        for i in range(len(self.speakers) - 1):
-            current = self.speakers[i]
-            next_segment = self.speakers[i + 1]
-            
-            # If current segment contains a question, the next should be from different speaker
-            if '?' in current["text"]:
-                if current["speaker"] == next_segment["speaker"]:
-                    next_segment["speaker"] = speaker_b_id if current["speaker"] == speaker_a_id else speaker_a_id
-        
-        # 2. Look for role-specific content markers
-        for i, segment in enumerate(self.speakers):
-            text = segment["text"].lower()
-            
-            # Expert knowledge indicators
-            if speaker_a_data.get("role") in ["expert", "teacher", "consultant"]:
-                knowledge_areas = speaker_a_data.get("knowledge_areas", [])
-                for area in knowledge_areas:
-                    if isinstance(area, str) and area.lower() in text:
-                        segment["speaker"] = speaker_a_id
-                        break
-                        
-            if speaker_b_data.get("role") in ["expert", "teacher", "consultant"]:
-                knowledge_areas = speaker_b_data.get("knowledge_areas", [])
-                for area in knowledge_areas:
-                    if isinstance(area, str) and area.lower() in text:
-                        segment["speaker"] = speaker_b_id
-                        break
-        
-        # 3. Look for speech pattern matches
-        for i, segment in enumerate(self.speakers):
-            text = segment["text"].lower()
-            
-            # Speaker A speech patterns
-            speech_patterns = speaker_a_data.get("speech_patterns", [])
-            for pattern in speech_patterns:
-                if isinstance(pattern, str) and len(pattern) > 5 and pattern.lower() in text:
-                    segment["speaker"] = speaker_a_id
-                    break
-                    
-            # Speaker B speech patterns
-            speech_patterns = speaker_b_data.get("speech_patterns", [])
-            for pattern in speech_patterns:
-                if isinstance(pattern, str) and len(pattern) > 5 and pattern.lower() in text:
-                    segment["speaker"] = speaker_b_id
-                    break
-                    
-        # 4. Ensure conversation flow (avoid unrealistically long monologues)
-        max_consecutive = 3  # Maximum consecutive paragraphs by same speaker
-        current_speaker = None
-        consecutive_count = 0
-        
-        for i, segment in enumerate(self.speakers):
-            if segment["speaker"] == current_speaker:
-                consecutive_count += 1
-                # If too many consecutive segments, alternate speakers
-                if consecutive_count > max_consecutive and i < len(self.speakers) - 1:
-                    # Only change if the next segment doesn't contain clearly personal information
-                    next_text = self.speakers[i + 1]["text"].lower()
-                    if not re.search(r'\bI\b|\bmy\b|\bmine\b|\bmyself\b', next_text):
-                        next_speaker = speaker_b_id if current_speaker == speaker_a_id else speaker_a_id
-                        self.speakers[i + 1]["speaker"] = next_speaker
-                        current_speaker = next_speaker
-                        consecutive_count = 1
-            else:
-                current_speaker = segment["speaker"]
-                consecutive_count = 1
-        
-    def _apply_deep_consistency_check(self, role_analysis):
-        """Perform deep consistency check to ensure speaker identity integrity."""
-        if len(self.speakers) < 3:
-            return
-            
-        # Create category maps for different types of first-person statements
-        identity_categories = {
-            "personal_beliefs": {"speaker": None, "regex": r'\bI (?:think|believe|feel|consider|assume|suppose)\b|\bin my (?:opinion|view|estimation|judgment)\b'},
-            "personal_experiences": {"speaker": None, "regex": r'\bI (?:have|had|went|experienced|saw|heard|did|tried)\b|\bmy (?:experience|background|history|life|past)\b'},
-            "personal_actions": {"speaker": None, "regex": r'\bI (?:will|would|could|can|am going to|plan to|want to|need to)\b'},
-            "personal_preferences": {"speaker": None, "regex": r'\bI (?:like|love|enjoy|prefer|dislike|hate)\b|\bmy (?:favorite|preference)\b'},
-            "self_references": {"speaker": None, "regex": r'\bmy (?:name|role|job|position|company|organization)\b|\bI am (?:a|an|the) (?:[a-z]+ist|[a-z]+er|expert|professional|specialist|consultant)\b'}
-        }
-        
-        # Speaker A/B to Speaker 1/2 mapping
-        speaker_map = {"A": "Speaker 1", "B": "Speaker 2", "Speaker A": "Speaker 1", "Speaker B": "Speaker 2"}
-        
-        # First pass: identify consistent patterns for each category
-        for segment in self.speakers:
-            text = segment["text"].lower()
-            speaker = segment["speaker"]
-            
-            for category, data in identity_categories.items():
-                if re.search(data["regex"], text):
-                    if data["speaker"] is None:
-                        # First occurrence of this category
-                        data["speaker"] = speaker
-        
-        # Second pass: fix inconsistencies
-        fixed_count = 0
-        for segment in self.speakers:
-            text = segment["text"].lower()
-            speaker = segment["speaker"]
-            
-            for category, data in identity_categories.items():
-                if data["speaker"] is not None and re.search(data["regex"], text) and speaker != data["speaker"]:
-                    # Inconsistency found - fix it
-                    segment["speaker"] = data["speaker"]
-                    fixed_count += 1
-        
-        if fixed_count > 0:
-            self.update_status(f"Deep consistency check: fixed {fixed_count} speaker attribution issues")
 
     def assign_speaker_names(self, speaker_map):
-        """Replace generic speaker labels with actual names."""
-        if not self.speakers:
-            return ""
+        """Apply custom speaker names to the transcript."""
+        if not hasattr(self, 'speakers') or not self.speakers:
+            return self.transcript
             
-        self.update_status("Assigning speaker names...")
-        updated_transcript = []
+        # Create a formatted transcript with the new speaker names
+        formatted_text = []
         
         for segment in self.speakers:
-            speaker_id = segment["speaker"]
-            speaker_name = speaker_map.get(speaker_id, speaker_id)
-            # Format with speaker name in bold
-            updated_transcript.append(f"{speaker_name}: {segment['text']}")
+            original_speaker = segment.get("speaker", "Unknown")
+            new_speaker = speaker_map.get(original_speaker, original_speaker)
+            text = segment.get("text", "")
             
-        result = "\n\n".join(updated_transcript)
-        self.transcript = result  # Update the transcript with speaker names
-        self.update_status("Speaker names assigned.")
-        return result
+            formatted_text.append(f"{new_speaker}: {text}")
+            
+        return "\n\n".join(formatted_text)
 
 # LLM Processing Class
 class LLMProcessor:
@@ -966,9 +1064,9 @@ class LLMProcessor:
         self.update_callback = update_callback
         self.chat_history = []
         
-    def update_status(self, message):
+    def update_status(self, message, percent=None):
         if self.update_callback:
-            wx.CallAfter(self.update_callback, message)
+            wx.CallAfter(self.update_callback, message, percent)
             
     def generate_response(self, prompt, temperature=None):
         """Generate a response from the LLM."""
@@ -979,7 +1077,7 @@ class LLMProcessor:
         messages = self.prepare_messages(prompt)
         
         try:
-            self.update_status("Generating response...")
+            self.update_status("Generating response...", percent=0)
             response = self.client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -992,11 +1090,11 @@ class LLMProcessor:
             self.chat_history.append({"role": "user", "content": prompt})
             self.chat_history.append({"role": "assistant", "content": response_text})
             
-            self.update_status("Response generated.")
+            self.update_status("Response generated.", percent=100)
             return response_text
             
         except Exception as e:
-            self.update_status(f"Error generating response: {str(e)}")
+            self.update_status(f"Error generating response: {str(e)}", percent=50)
             return f"Error: {str(e)}"
             
     def prepare_messages(self, prompt):
@@ -1020,14 +1118,14 @@ class LLMProcessor:
     def clear_chat_history(self):
         """Clear the chat history."""
         self.chat_history = []
-        self.update_status("Chat history cleared.")
+        self.update_status("Chat history cleared.", percent=0)
         
     def summarize_transcript(self, transcript, template_name=None):
         """Summarize a transcript, optionally using a template."""
         if not transcript:
             return "No transcript to summarize."
             
-        self.update_status("Generating summary...")
+        self.update_status("Generating summary...", percent=0)
         
         prompt = f"Summarize the following transcript:"
         template = None
@@ -1057,11 +1155,11 @@ class LLMProcessor:
             with open(summary_filename, 'w', encoding='utf-8') as f:
                 f.write(summary)
                 
-            self.update_status(f"Summary generated and saved to {summary_filename}.")
+            self.update_status(f"Summary generated and saved to {summary_filename}.", percent=100)
             return summary
             
         except Exception as e:
-            self.update_status(f"Error generating summary: {str(e)}")
+            self.update_status(f"Error generating summary: {str(e)}", percent=50)
             return f"Error: {str(e)}"
 
 # GUI - Main Application Frame
@@ -1092,7 +1190,7 @@ class MainFrame(wx.Frame):
         ensure_directories()
         
         # Status update
-        self.update_status("Application ready.")
+        self.update_status("Application ready.", percent=0)
         
         # Display info about supported audio formats
         wx.CallLater(1000, self.show_format_info)
@@ -1483,8 +1581,8 @@ class MainFrame(wx.Frame):
         """Handle application close event."""
         self.Destroy()
         
-    def update_status(self, message):
-        """Update the status bar with a message."""
+    def update_status(self, message, percent=None):
+        """Update the status bar with a message and optional progress percentage."""
         self.status_bar.SetStatusText(message)
         
     def on_browse_audio(self, event):
@@ -1533,7 +1631,7 @@ class MainFrame(wx.Frame):
                 return
                 
             self.audio_file_path.SetValue(path)
-            self.update_status(f"Selected audio file: {os.path.basename(path)} ({file_size_mb:.1f}MB)")
+            self.update_status(f"Selected audio file: {os.path.basename(path)} ({file_size_mb:.1f}MB)", percent=0)
             self.update_button_states()
             
     def on_transcribe(self, event):
@@ -1560,7 +1658,7 @@ class MainFrame(wx.Frame):
         self.audio_processor.audio_file_path = self.audio_file_path.GetValue()
         
         # Update status message
-        self.update_status(f"Transcribing in {lang_selection}...")
+        self.update_status(f"Transcribing in {lang_selection}...", percent=0)
         
         # Disable buttons during processing
         self.transcribe_btn.Disable()
@@ -1584,7 +1682,7 @@ class MainFrame(wx.Frame):
             
             wx.CallAfter(self.transcript_text.SetValue, transcription_notice + self.audio_processor.transcript)
             wx.CallAfter(self.update_button_states)
-            wx.CallAfter(self.update_status, f"Transcription complete: {len(self.audio_processor.transcript)} characters")
+            wx.CallAfter(self.update_status, f"Transcription complete: {len(self.audio_processor.transcript)} characters", percent=100)
             
             # Show a dialog informing the user to use speaker identification
             wx.CallAfter(self.show_speaker_id_hint)
@@ -1641,7 +1739,7 @@ class MainFrame(wx.Frame):
                 wx.CallAfter(wx.MessageBox, f"Transcription error: {error_msg}", "Error", wx.OK | wx.ICON_ERROR)
         finally:
             wx.CallAfter(self.transcribe_btn.Enable)
-            wx.CallAfter(self.update_status, "Ready")
+            wx.CallAfter(self.update_status, "Ready", percent=0)
             
     def show_speaker_id_hint(self):
         """Show a hint dialog about using speaker identification."""
@@ -1706,71 +1804,87 @@ class MainFrame(wx.Frame):
         threading.Thread(target=self.identify_speakers_thread, args=(progress_dialog,)).start()
     
     def identify_speakers_thread(self, progress_dialog=None):
-        """Thread function for speaker identification."""
+        """Run speaker identification in a separate thread."""
         try:
-            # Show processing message
-            wx.CallAfter(self.update_status, "Processing speaker identification...")
-            if progress_dialog:
-                wx.CallAfter(progress_dialog.Update, 20, "Analyzing transcript for different speakers...")
+            # Get transcript from the transcript output field
+            transcript = self.transcript_text.GetValue()
+            
+            # Check if transcript exists
+            if not transcript:
+                raise ValueError("No transcript available. Please transcribe an audio file first.")
+            
+            # Create progress dialog if not provided
+            if not progress_dialog:
+                progress_dialog = wx.ProgressDialog(
+                    "Identifying Speakers",
+                    "Initializing speaker identification...",
+                    maximum=100,
+                    parent=self,
+                    style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE | wx.PD_SMOOTH | wx.PD_CAN_ABORT
+                )
+            
+            # Register update callback for status updates
+            def on_progress_update(message, percent=None):
+                if percent is not None:
+                    wx.CallAfter(progress_dialog.Update, int(percent * 100), message)
+                else:
+                    wx.CallAfter(progress_dialog.Pulse, message)
+            
+            # First check if we have audio file for diarization
+            file_path = self.audio_file_path.GetValue() if hasattr(self, 'audio_file_path') else None
+            
+            if file_path and os.path.exists(file_path) and PYANNOTE_AVAILABLE:
+                # Let user know we're doing audio-based speaker ID
+                wx.CallAfter(progress_dialog.Update, 5, "Initializing audio diarization...")
                 
-            # Small delay to ensure the UI updates
-            time.sleep(0.5)
-            
-            # Check if PyAnnote is available but token is missing
-            if PYANNOTE_AVAILABLE and self.config_manager.get_pyannote_token() == "":
-                # Close the progress dialog
-                if progress_dialog:
-                    wx.CallAfter(progress_dialog.Destroy)
-                    
-                # Show a message about setting up the token
-                wx.CallAfter(self.show_token_missing_dialog)
-                return
-                
-            # Check if we're using diarization
-            using_diarization = PYANNOTE_AVAILABLE and hasattr(self.audio_processor, 'audio_file_path') and self.audio_processor.audio_file_path
-            
-            if using_diarization and progress_dialog:
-                wx.CallAfter(progress_dialog.Update, 30, "Performing audio diarization analysis...")
-            elif progress_dialog:
-                wx.CallAfter(progress_dialog.Update, 30, "Analyzing text patterns...")
-            
-            # Force the dialog to update before the potentially lengthy API call
-            wx.Yield()
-            
-            speakers = self.audio_processor.identify_speakers(self.audio_processor.transcript)
-            
-            if progress_dialog:
-                wx.CallAfter(progress_dialog.Update, 80, "Creating speaker mapping interface...")
-            
-            # Clear existing mapping UI
-            wx.CallAfter(self.speaker_mapping_sizer.Clear, True)
-            
-            # Create UI for speaker mapping
-            if speakers:
-                wx.CallAfter(self.create_speaker_mapping_ui, speakers)
-                speaker_count = len(set(s["speaker"] for s in speakers))
-                
-                # Check which method was used
-                method_used = "audio diarization" if (using_diarization and hasattr(self.audio_processor, 'diarization')) else "text analysis"
-                
-                wx.CallAfter(self.update_status, 
-                            f"Speaker identification complete using {method_used}. Found {speaker_count} speakers.")
-                
-                if progress_dialog:
-                    wx.CallAfter(progress_dialog.Update, 100, 
-                                f"Found {speaker_count} speakers using {method_used}!")
+                # Call identify_speakers_with_diarization
+                speakers = self.audio_processor.identify_speakers_with_diarization(file_path, transcript)
             else:
-                wx.CallAfter(self.update_status, "No speakers identified.")
-                if progress_dialog:
-                    wx.CallAfter(progress_dialog.Update, 100, "No speakers were identified in the transcript.")
-        except Exception as e:
-            if progress_dialog:
-                wx.CallAfter(progress_dialog.Destroy)
-            wx.CallAfter(wx.MessageBox, f"Speaker identification error: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
-        finally:
-            wx.CallAfter(self.identify_speakers_btn.Enable)
+                # Fall back to text-based approach
+                wx.CallAfter(progress_dialog.Update, 5, "Using text-based speaker identification...")
+                speakers = self.audio_processor.identify_speakers_simple(transcript)
+            
+            # Check the result
+            if not speakers or len(speakers) == 0:
+                wx.CallAfter(progress_dialog.Update, 100, "Speaker identification failed.")
+                wx.CallAfter(wx.MessageBox, "Unable to identify speakers.", "Error", wx.OK | wx.ICON_ERROR)
+                return
+            
+            # Close progress dialog
+            wx.CallAfter(progress_dialog.Update, 100, "Speaker identification complete!")
+            
+            # Create the speaker mapping UI
+            wx.CallAfter(self.create_speaker_mapping_ui, speakers)
+            
+            # Update transcript with speaker labels for preview
+            formatted_transcript = self.format_transcript_with_speakers(speakers)
+            wx.CallAfter(self.transcript_text.SetValue, formatted_transcript)
+            
+            # Enable Apply button
             wx.CallAfter(self.update_button_states)
             
+        except Exception as e:
+            wx.CallAfter(progress_dialog.Update, 100, f"Error: {str(e)}")
+            wx.CallAfter(wx.MessageBox, f"Error identifying speakers: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
+            import traceback
+            traceback.print_exc()
+    
+    def format_transcript_with_speakers(self, speakers):
+        """Format transcript with speaker labels for display purposes."""
+        if not speakers:
+            return self.audio_processor.transcript
+            
+        formatted_text = []
+        
+        for segment in speakers:
+            speaker = segment.get("speaker", "Unknown")
+            text = segment.get("text", "")
+            
+            # Format with bold speaker name
+            formatted_text.append(f"{speaker}: {text}")
+            
+        return "\n\n".join(formatted_text)
+    
     def show_token_missing_dialog(self):
         """Show a dialog explaining that PyAnnote is installed but the token is missing."""
         dlg = wx.MessageDialog(
@@ -1818,12 +1932,12 @@ class MainFrame(wx.Frame):
                 speaker_count = len(set(s["speaker"] for s in speakers))
                 
                 wx.CallAfter(self.update_status, 
-                            f"Speaker identification complete using text analysis. Found {speaker_count} speakers.")
+                            f"Speaker identification complete using text analysis. Found {speaker_count} speakers.", percent=100)
                 
                 wx.CallAfter(progress_dialog.Update, 100, 
                             f"Found {speaker_count} speakers using text analysis!")
             else:
-                wx.CallAfter(self.update_status, "No speakers identified.")
+                wx.CallAfter(self.update_status, "No speakers identified.", percent=100)
                 wx.CallAfter(progress_dialog.Update, 100, "No speakers were identified in the transcript.")
                 
         except Exception as e:
@@ -1931,7 +2045,7 @@ class MainFrame(wx.Frame):
                 
         if event is not None:  # Only show status message if called directly
             method_description = "audio diarization" if using_diarization else "text analysis"
-            self.update_status(f"Speaker names applied to transcript using {method_description}.")
+            self.update_status(f"Speaker names applied to transcript using {method_description}.", percent=100)
         
     def on_summarize(self, event):
         """Generate a summary of the transcript."""
@@ -2173,7 +2287,7 @@ class MainFrame(wx.Frame):
                 msg += f"FFmpeg installation instructions:\n{ffmpeg_install}\n\n"
                 msg += "FFmpeg is required for processing M4A files. Without it, M4A transcription will likely fail."
             
-            self.update_status("FFmpeg required for M4A support - please install it")
+            self.update_status("FFmpeg required for M4A support - please install it", percent=0)
             
             # Always show FFmpeg warning because it's critical
             if ffmpeg_missing:
