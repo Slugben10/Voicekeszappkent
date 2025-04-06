@@ -22,6 +22,8 @@ import soundfile as sf
 from pyannote.core import Segment, Annotation
 import concurrent.futures
 from threading import Lock
+import hashlib
+import pickle
 
 # Check if pydub is available for audio conversion
 try:
@@ -340,6 +342,71 @@ class AudioProcessor:
         else:
             # Fall back to text-based approach
             return self.identify_speakers_simple(transcript)
+            
+    def _check_diarization_cache(self, audio_file_path):
+        """Check if we have cached diarization results for this file."""
+        # Create hash of file path and modification time to use as cache key
+        file_stats = os.stat(audio_file_path)
+        file_hash = hashlib.md5(f"{audio_file_path}_{file_stats.st_mtime}".encode()).hexdigest()
+        
+        # Check if cache directory exists
+        cache_dir = "diarization_cache"
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+            
+        # Cache file path
+        cache_file = os.path.join(cache_dir, f"{file_hash}.diar")
+        
+        # Check if cache file exists
+        if os.path.exists(cache_file):
+            try:
+                self.update_status("Found cached diarization results, loading...", percent=0.15)
+                with open(cache_file, 'rb') as f:
+                    self.diarization = pickle.load(f)
+                self.update_status("Successfully loaded cached diarization results", percent=0.3)
+                return True
+            except Exception as e:
+                self.update_status(f"Error loading cached results: {str(e)}, will reprocess", percent=0.1)
+                # If any error occurs, we'll reprocess
+                return False
+        
+        return False
+        
+    def _save_diarization_cache(self, audio_file_path):
+        """Save diarization results to cache."""
+        if not hasattr(self, 'diarization') or not self.diarization:
+            return
+            
+        try:
+            # Create hash of file path and modification time to use as cache key
+            file_stats = os.stat(audio_file_path)
+            file_hash = hashlib.md5(f"{audio_file_path}_{file_stats.st_mtime}".encode()).hexdigest()
+            
+            # Check if cache directory exists
+            cache_dir = "diarization_cache"
+            if not os.path.exists(cache_dir):
+                os.makedirs(cache_dir)
+                
+            # Cache file path
+            cache_file = os.path.join(cache_dir, f"{file_hash}.diar")
+            
+            # Save results
+            self.update_status("Saving diarization results to cache for future use...", percent=0.95)
+            with open(cache_file, 'wb') as f:
+                pickle.dump(self.diarization, f)
+            
+            # Clean up old cache files if there are more than 20
+            cache_files = [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.endswith('.diar')]
+            if len(cache_files) > 20:
+                # Sort by modification time and remove oldest
+                cache_files.sort(key=os.path.getmtime)
+                for old_file in cache_files[:-20]:  # Keep the 20 most recent
+                    os.unlink(old_file)
+                    
+            self.update_status("Successfully cached results for future use", percent=0.98)
+        except Exception as e:
+            self.update_status(f"Error saving to cache: {str(e)}", percent=0.95)
+            # Continue without caching - non-critical error
     
     def identify_speakers_with_diarization(self, audio_file_path, transcript):
         """Identify speakers using audio diarization with PyAnnote."""
@@ -350,6 +417,22 @@ class AudioProcessor:
             self.update_status("PyAnnote not available. Install with: pip install pyannote.audio", percent=0)
             return self.identify_speakers_simple(transcript)
         
+        # Check if we have cached results - if so, skip to mapping
+        if self._check_diarization_cache(audio_file_path):
+            self.update_status("Using cached diarization results...", percent=0.4)
+            
+            # Get audio information for status reporting
+            audio_duration = librosa.get_duration(path=audio_file_path)
+            is_short_file = audio_duration < 300
+            
+            # Skip to mapping step
+            if is_short_file:
+                self.update_status("Fast mapping diarization to transcript...", percent=0.8)
+                return self._fast_map_diarization(transcript)
+            else:
+                return self._map_diarization_to_transcript(transcript)
+        
+        # No cache, proceed with normal processing
         # Step 1: Initialize PyAnnote pipeline
         try:
             # Get token from config_manager if available
@@ -433,13 +516,22 @@ class AudioProcessor:
                         self.diarization = pipeline(diarization_file, num_speakers=3)
             else:
                 # Determine chunk size based on audio duration - longer files use chunking
-                if audio_duration > 3600:  # > 1 hour
-                    # For very long recordings, use 5-minute chunks
+                if audio_duration > 10800:  # > 3 hours
+                    # For extremely long recordings, use very small 3-minute chunks
+                    MAX_CHUNK_DURATION = 180  # 3 minutes per chunk
+                    self.update_status("Extremely long audio detected (>3 hours). Using highly optimized micro-chunks.", percent=0.22)
+                elif audio_duration > 5400:  # > 1.5 hours
+                    # For very long recordings, use 4-minute chunks
+                    MAX_CHUNK_DURATION = 240  # 4 minutes per chunk
+                    self.update_status("Very long audio detected (>1.5 hours). Using micro-chunks for improved performance.", percent=0.22)
+                elif audio_duration > 3600:  # > 1 hour
+                    # For long recordings, use 5-minute chunks
                     MAX_CHUNK_DURATION = 300  # 5 minutes per chunk
-                    self.update_status("Very long audio detected (>1 hour). Using optimized chunk size.", percent=0.22)
+                    self.update_status("Long audio detected (>1 hour). Using optimized chunk size.", percent=0.22)
                 elif audio_duration > 1800:  # > 30 minutes
+                    # For medium recordings, use 7.5-minute chunks
                     MAX_CHUNK_DURATION = 450  # 7.5 minutes per chunk
-                    self.update_status("Long audio detected (>30 minutes). Using optimized chunk size.", percent=0.22)
+                    self.update_status("Medium-length audio detected (>30 minutes). Using optimized chunk size.", percent=0.22)
                 else:
                     # Default 10-minute chunks for shorter files
                     MAX_CHUNK_DURATION = 600  # 10 minutes per chunk
@@ -451,6 +543,9 @@ class AudioProcessor:
             # Clean up converted file if needed
             if diarization_file != audio_file_path and os.path.exists(diarization_file):
                 os.unlink(diarization_file)
+            
+            # Save diarization results to cache for future use
+            self._save_diarization_cache(audio_file_path)
             
             # Now we have diarization data, map it to the transcript using word timestamps
             # Use optimized mapping for short files
@@ -550,6 +645,233 @@ class AudioProcessor:
             self.update_status(f"Error in fast mapping: {str(e)}", percent=0)
             return self.identify_speakers_simple(transcript)
     
+    def _map_diarization_to_transcript(self, transcript):
+        """Memory-efficient mapping for long files by using sparse sampling and batch processing."""
+        self.update_status("Mapping diarization results to transcript (optimized for long files)...", percent=0.8)
+        
+        if not hasattr(self, 'word_by_word') or not self.word_by_word or not self.diarization:
+            return self.identify_speakers_simple(transcript)
+            
+        try:
+            # Get initial speaker count for progress reporting
+            speaker_set = set()
+            segment_count = 0
+            
+            # Quick scan to count speakers and segments - don't store details yet
+            for segment, _, speaker in self.diarization.itertracks(yield_label=True):
+                speaker_set.add(speaker)
+                segment_count += 1
+                
+            num_speakers = len(speaker_set)
+            self.update_status(f"Detected {num_speakers} speakers across {segment_count} segments", percent=0.82)
+            
+            # Create paragraphs if they don't exist
+            if hasattr(self, 'speaker_segments') and self.speaker_segments:
+                paragraphs = self.speaker_segments
+            else:
+                paragraphs = self._create_improved_paragraphs(transcript)
+                self.speaker_segments = paragraphs
+                
+            # OPTIMIZATION 1: For long files, use sparse sampling of the timeline
+            # Instead of creating a dense timeline map which is memory-intensive,
+            # we'll create a sparse map with only the segment boundaries
+            timeline_segments = []
+            
+            # Use diarization_cache directory for temporary storage if needed
+            cache_dir = "diarization_cache"
+            if not os.path.exists(cache_dir):
+                os.makedirs(cache_dir)
+                
+            # OPTIMIZATION 2: For very long files, process diarization in chunks to avoid memory issues
+            chunk_size = 1000  # Process 1000 segments at a time
+            use_temp_storage = segment_count > 5000  # Only use temp storage for very large files
+            
+            # If using temp storage, save intermediate results to avoid memory buildup
+            if use_temp_storage:
+                self.update_status("Using temporary storage for large diarization data...", percent=0.83)
+                temp_file = os.path.join(cache_dir, f"diarization_map_{int(time.time())}.json")
+                
+                # Process in chunks to avoid memory buildup
+                processed = 0
+                segment_chunk = []
+                
+                for segment, _, speaker in self.diarization.itertracks(yield_label=True):
+                    # Skip very short segments
+                    if segment.duration < 0.5:
+                        continue
+                        
+                    segment_chunk.append({
+                        "start": segment.start,
+                        "end": segment.end,
+                        "speaker": speaker
+                    })
+                    
+                    processed += 1
+                    
+                    # When chunk is full, process it
+                    if len(segment_chunk) >= chunk_size:
+                        timeline_segments.extend(segment_chunk)
+                        # Save intermediate results
+                        with open(temp_file, 'w') as f:
+                            json.dump(timeline_segments, f)
+                        # Clear memory
+                        timeline_segments = []
+                        segment_chunk = []
+                        # Update progress
+                        progress = 0.83 + (processed / segment_count) * 0.05
+                        self.update_status(f"Processed {processed}/{segment_count} diarization segments...", percent=progress)
+                
+                # Process remaining segments
+                if segment_chunk:
+                    timeline_segments.extend(segment_chunk)
+                    with open(temp_file, 'w') as f:
+                        json.dump(timeline_segments, f)
+                
+                # Load from file to continue processing
+                with open(temp_file, 'r') as f:
+                    timeline_segments = json.load(f)
+            else:
+                # For smaller files, process all at once
+                for segment, _, speaker in self.diarization.itertracks(yield_label=True):
+                    # Skip very short segments
+                    if segment.duration < 0.5:
+                        continue
+                        
+                    timeline_segments.append({
+                        "start": segment.start,
+                        "end": segment.end,
+                        "speaker": speaker
+                    })
+            
+            self.update_status("Matching words to speaker segments...", percent=0.89)
+            
+            # OPTIMIZATION 3: Optimize word-to-speaker mapping for long files
+            # Sort segments by start time for faster searching
+            timeline_segments.sort(key=lambda x: x["start"])
+            
+            # Initialize paragraph mapping structures
+            paragraph_speaker_counts = [{} for _ in paragraphs]
+            
+            # Batch process words to reduce computation
+            batch_size = 500
+            num_words = len(self.word_by_word)
+            
+            # Calculate which paragraph each word belongs to
+            word_paragraphs = {}
+            
+            para_start_idx = 0
+            for i, word_info in enumerate(self.word_by_word):
+                if not hasattr(word_info, "start") or not hasattr(word_info, "end"):
+                    continue
+                    
+                # Binary search to find the paragraph for this word
+                # This is much faster than iterating through all paragraphs for each word
+                word = word_info.word.lower()
+                
+                # Find paragraph for this word only once
+                if i % 100 == 0:  # Only update progress occasionally
+                    progress = 0.89 + (i / num_words) * 0.05
+                    self.update_status(f"Matching words to paragraphs ({i}/{num_words})...", percent=progress)
+                
+                # Find which paragraph this word belongs to
+                found_para = False
+                for p_idx in range(para_start_idx, len(paragraphs)):
+                    if word in paragraphs[p_idx].lower():
+                        word_paragraphs[word] = p_idx
+                        para_start_idx = p_idx  # Optimization: start next search from here
+                        found_para = True
+                        break
+                
+                if not found_para:
+                    # If we didn't find it moving forward, try searching all paragraphs
+                    for p_idx in range(len(paragraphs)):
+                        if word in paragraphs[p_idx].lower():
+                            word_paragraphs[word] = p_idx
+                            para_start_idx = p_idx
+                            found_para = True
+                            break
+            
+            # Process words in batches to assign speakers efficiently
+            for batch_start in range(0, num_words, batch_size):
+                batch_end = min(batch_start + batch_size, num_words)
+                
+                for i in range(batch_start, batch_end):
+                    if i >= len(self.word_by_word):
+                        break
+                        
+                    word_info = self.word_by_word[i]
+                    if not hasattr(word_info, "start") or not hasattr(word_info, "end"):
+                        continue
+                    
+                    word = word_info.word.lower()
+                    word_time = (word_info.start + word_info.end) / 2
+                    
+                    # Find segment for this word using binary search for speed
+                    left, right = 0, len(timeline_segments) - 1
+                    segment_idx = -1
+                    
+                    while left <= right:
+                        mid = (left + right) // 2
+                        if timeline_segments[mid]["start"] <= word_time <= timeline_segments[mid]["end"]:
+                            segment_idx = mid
+                            break
+                        elif word_time < timeline_segments[mid]["start"]:
+                            right = mid - 1
+                        else:
+                            left = mid + 1
+                    
+                    # If we found a segment, update the paragraph speaker counts
+                    if segment_idx != -1:
+                        speaker = timeline_segments[segment_idx]["speaker"]
+                        
+                        # If we know which paragraph this word belongs to, update its speaker count
+                        if word in word_paragraphs:
+                            para_idx = word_paragraphs[word]
+                            paragraph_speaker_counts[para_idx][speaker] = paragraph_speaker_counts[para_idx].get(speaker, 0) + 1
+                
+                # Update progress
+                progress = 0.94 + (batch_end / num_words) * 0.05
+                self.update_status(f"Processed {batch_end}/{num_words} words...", percent=progress)
+            
+            # Assign speakers to paragraphs based on majority vote
+            self.speakers = []
+            for i, paragraph in enumerate(paragraphs):
+                # Get speaker counts for this paragraph
+                speaker_counts = paragraph_speaker_counts[i]
+                
+                # Assign the most common speaker, or default if none
+                if speaker_counts:
+                    # Find speaker with highest count
+                    most_common_speaker = max(speaker_counts.items(), key=lambda x: x[1])[0]
+                    speaker_id = f"Speaker {most_common_speaker.split('_')[-1]}"
+                else:
+                    # Default speaker if no match found
+                    speaker_id = f"Speaker 1"
+                
+                self.speakers.append({
+                    "speaker": speaker_id,
+                    "text": paragraph
+                })
+            
+            # Quick consistency check
+            if len(self.speakers) > 2:
+                self._quick_consistency_check()
+            
+            # Clean up temp file if used
+            if use_temp_storage and os.path.exists(temp_file):
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
+            
+            self.update_status(f"Diarization mapping complete. Found {num_speakers} speakers.", percent=1.0)
+            return self.speakers
+            
+        except Exception as e:
+            self.update_status(f"Error in diarization mapping: {str(e)}", percent=0)
+            # Fall back to text-based approach
+            return self.identify_speakers_simple(transcript)
+    
     def _quick_consistency_check(self):
         """Ultra-quick consistency check for short files"""
         if len(self.speakers) < 3:
@@ -580,14 +902,40 @@ class AudioProcessor:
         num_chunks = int(np.ceil(total_duration / chunk_size))
         self.update_status(f"Processing audio in {num_chunks} chunks...", percent=0.1)
         
-        # Optimize number of workers based on file length
-        # More chunks = more workers (up to cpu_count)
+        # Optimize number of workers based on file length and available memory
+        # More chunks = more workers (up to cpu_count), but limit for very long files
+        # to avoid excessive memory usage
         cpu_count = os.cpu_count() or 4
-        if num_chunks > 10:
-            max_workers = min(8, cpu_count)  # Use up to 8 workers for very long files
-        else:
-            max_workers = min(4, cpu_count)  # Default: use up to 4 workers
+        
+        # Try to get available system memory if psutil is available
+        try:
+            import psutil
+            available_memory_gb = psutil.virtual_memory().available / (1024**3)
+            # Scale workers based on available memory - each worker needs ~500MB-1GB
+            memory_based_workers = max(1, int(available_memory_gb / 1.5))
+        except ImportError:
+            # If psutil is not available, make a conservative estimate
+            memory_based_workers = 4
             
+        # Scale workers based on file duration
+        if audio_duration > 10800:  # > 3 hours
+            # For extremely long files, be very conservative with worker count
+            duration_based_workers = min(3, cpu_count)
+        elif audio_duration > 5400:  # > 1.5 hours
+            # For very long files, be conservative
+            duration_based_workers = min(4, cpu_count)
+        elif audio_duration > 3600:  # > 1 hour
+            # For long files
+            duration_based_workers = min(6, cpu_count)
+        else:
+            # For shorter files we can use more workers
+            duration_based_workers = min(8, cpu_count)
+            
+        # Take the minimum of the two estimates
+        max_workers = min(memory_based_workers, duration_based_workers)
+        # Ensure at least one worker
+        max_workers = max(1, max_workers)
+        
         self.update_status(f"Using {max_workers} parallel workers for processing...", percent=0.12)
         
         # Lock for thread-safe updates

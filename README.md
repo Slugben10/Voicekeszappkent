@@ -11,6 +11,8 @@ This application provides tools for transcribing audio files, identifying speake
 - Summarize transcripts with customizable templates
 - Support for multiple languages
 - Customizable speaker naming
+- **New!** Optimized handling of long audio files (>1.5 hours)
+- **New!** Smart caching system for faster processing of previously analyzed files
 
 ## Installation
 
@@ -46,6 +48,21 @@ pip install pyannote.audio torch
 5. In the app, go to Settings and enter your Hugging Face token
 
 6. Enable "Use voice diarization for speaker identification"
+
+## Handling Long Audio Files (New!)
+
+The app now includes optimized processing for long audio files:
+
+- **Adaptive chunking**: Automatically adjusts processing chunk size based on audio length
+- **Memory-efficient algorithm**: Uses optimized algorithms for speaker mapping in long files
+- **Smart caching**: Saves diarization results to avoid reprocessing the same file twice
+- **Resource scaling**: Adjusts CPU/memory usage based on file length and available system resources
+- **Progress tracking**: More detailed progress updates during long file processing
+
+For best results with long files (>1.5 hours):
+- Ensure at least 8GB of RAM is available
+- Be patient during the first processing of a file (subsequent uses will be much faster)
+- If possible, use a computer with a dedicated GPU for faster processing
 
 ## Usage
 

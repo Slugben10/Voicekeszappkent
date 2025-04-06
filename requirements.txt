@@ -9,6 +9,9 @@ pydub>=0.25.1
 pyannote.audio>=3.0.0
 torch>=2.0.0
 
+# System monitoring for performance optimization
+psutil>=5.9.0
+
 # If you're on Windows, you might need to install FFmpeg separately.
 # On macOS: brew install ffmpeg
 # On Ubuntu/Debian: apt-get install ffmpeg
