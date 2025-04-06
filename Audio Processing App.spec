@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('/Users/binobenjamin/Documents/Audio/.venv/lib/python3.9/site-packages/lightning_fabric/version.info', 'lightning_fabric'), ('/Users/binobenjamin/Documents/Audio/.venv/lib/python3.9/site-packages/speechbrain/version.txt', 'speechbrain'), ('/Users/binobenjamin/Documents/Audio/.venv/lib/python3.9/site-packages/speechbrain/utils', 'speechbrain/utils'), ('/Users/binobenjamin/Documents/Audio/.venv/lib/python3.9/site-packages/speechbrain/dataio', 'speechbrain/dataio')],
     hiddenimports=['openai', 'wx', 'wx.adv'],
     hookspath=[],
     hooksconfig={},
