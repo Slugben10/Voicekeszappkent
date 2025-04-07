@@ -1,3 +1,12 @@
+# Disable screen access check
+import os
+import sys
+if sys.platform == 'darwin':
+    os.environ['PYTHONFRAMEWORK'] = '1'
+    os.environ['DISPLAY'] = ':0'
+    os.environ['WX_NO_DISPLAY_CHECK'] = '1'
+    os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
+
 import os
 import sys
 import wx

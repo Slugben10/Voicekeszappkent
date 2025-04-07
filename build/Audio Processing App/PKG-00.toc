@@ -38,6 +38,7 @@
   ('pyiboot01_bootstrap',
    '/Users/binobenjamin/Documents/Audio/.venv/lib/python3.9/site-packages/PyInstaller/loader/pyiboot01_bootstrap.py',
    'PYSOURCE'),
+  ('wx_path', '/Users/binobenjamin/Documents/Audio/wx_path.py', 'PYSOURCE'),
   ('pyi_rth_inspect',
    '/Users/binobenjamin/Documents/Audio/.venv/lib/python3.9/site-packages/PyInstaller/hooks/rthooks/pyi_rth_inspect.py',
    'PYSOURCE'),
