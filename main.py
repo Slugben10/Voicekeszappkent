@@ -1,11 +1,59 @@
 # Disable screen access check
 import os
 import sys
-if sys.platform == 'darwin':
+import platform
+
+# For macOS, implement comprehensive screen access check bypass
+if platform.system() == 'darwin':
+    # Set all required environment variables
     os.environ['PYTHONFRAMEWORK'] = '1'
     os.environ['DISPLAY'] = ':0'
     os.environ['WX_NO_DISPLAY_CHECK'] = '1'
     os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
+    
+    # Function to handle uncaught exceptions in the app
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        import traceback
+        error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        
+        # Try to show a dialog if possible, otherwise print to stderr
+        try:
+            import wx
+            app = wx.App(False)
+            wx.MessageBox(f"An error occurred:\n\n{error_msg}", "Application Error", wx.OK | wx.ICON_ERROR)
+            app.MainLoop()
+        except:
+            sys.stderr.write(f"FATAL ERROR: {error_msg}\n")
+        
+        # Exit with error code
+        sys.exit(1)
+    
+    # Set the exception handler
+    sys.excepthook = handle_exception
+
+    # Try to patch wxPython directly
+    try:
+        import wx
+        
+        # Patch wx.App to avoid screen check
+        if hasattr(wx, 'App'):
+            original_init = wx.App.__init__
+            
+            def patched_init(self, *args, **kwargs):
+                # Force redirect to False to avoid screen check issues
+                kwargs['redirect'] = False
+                return original_init(self, *args, **kwargs)
+            
+            wx.App.__init__ = patched_init
+        
+        # Try to patch _core directly
+        if hasattr(wx, '_core'):
+            if hasattr(wx._core, '_macIsRunningOnMainDisplay'):
+                # Replace with function that always returns True
+                wx._core._macIsRunningOnMainDisplay = lambda: True
+    except Exception as e:
+        # Not a fatal error, just log it
+        print(f"Warning: Could not patch wxPython components: {e}")
 
 import os
 import sys
@@ -55,21 +103,106 @@ except ImportError:
 # Ensure required directories exist
 def ensure_directories():
     """Create necessary directories if they don't exist."""
-    directories = ["Transcripts", "Summaries"]
-    for directory in directories:
-        if not os.path.exists(directory):
-            os.makedirs(directory)
+    import os
+    import platform
+    import sys
+    from pathlib import Path
+    
+    # For macOS app bundle, use proper app storage locations
+    if platform.system() == 'darwin' and getattr(sys, 'frozen', False):
+        try:
+            # Use ~/Documents for user data
+            home_dir = Path.home()
+            app_name = "Audio Processing App"
+            
+            # Create app directory in Documents
+            app_dir = home_dir / "Documents" / app_name
+            
+            # Define required directories
+            directories = [
+                app_dir,
+                app_dir / "Transcripts", 
+                app_dir / "Summaries",
+                app_dir / "diarization_cache"
+            ]
+            
+            # Create the directories if they don't exist
+            for directory in directories:
+                if not directory.exists():
+                    try:
+                        directory.mkdir(parents=True, exist_ok=True)
+                        print(f"Created directory: {directory}")
+                    except Exception as e:
+                        print(f"Error creating directory {directory}: {e}")
+            
+            # Return the app directory path for reference
+            return str(app_dir)
+        except Exception as e:
+            # If we can't create directories in Documents, create them in /tmp as a fallback
+            print(f"Error creating directories in Documents: {e}")
+            try:
+                tmp_dir = Path("/tmp") / "AudioProcessingApp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Create subdirectories
+                (tmp_dir / "Transcripts").mkdir(exist_ok=True)
+                (tmp_dir / "Summaries").mkdir(exist_ok=True)
+                (tmp_dir / "diarization_cache").mkdir(exist_ok=True)
+                
+                print(f"Created temporary directories in {tmp_dir}")
+                return str(tmp_dir)
+            except Exception as e2:
+                print(f"Failed to create directories in /tmp: {e2}")
+                # Return current directory as a last resort
+                return os.path.abspath('.')
+    else:
+        # For normal terminal execution, use relative paths but first check if they can be created
+        try:
+            directories = ["Transcripts", "Summaries", "diarization_cache"]
+            for directory in directories:
+                if not os.path.exists(directory):
+                    os.makedirs(directory)
+            
+            # Return current directory for reference
+            return os.path.abspath('.')
+        except OSError as e:
+            # If we can't create in current directory, try user's home directory
+            print(f"Error creating directories in current path: {e}")
+            try:
+                home_dir = Path.home()
+                app_dir = home_dir / "AudioProcessingApp"
+                app_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Create subdirectories
+                (app_dir / "Transcripts").mkdir(exist_ok=True)
+                (app_dir / "Summaries").mkdir(exist_ok=True)
+                (app_dir / "diarization_cache").mkdir(exist_ok=True)
+                
+                print(f"Created directories in {app_dir}")
+                return str(app_dir)
+            except Exception as e2:
+                print(f"Failed to create directories in home directory: {e2}")
+                # Return current directory as a last resort, even if we can't write to it
+                return os.path.abspath('.')
 
 # Global variables
 app_name = "Audio Processing App"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 WHISPER_MODEL = "whisper-1"
 client = None  # OpenAI client instance
+APP_BASE_DIR = None  # Application base directory
 
 # Configuration Manager
 class ConfigManager:
     def __init__(self):
-        self.config_file = "config.json"
+        global APP_BASE_DIR
+        
+        # Use app base directory if available, otherwise use current directory
+        if APP_BASE_DIR:
+            self.config_file = os.path.join(APP_BASE_DIR, "config.json")
+        else:
+            self.config_file = "config.json"
+            
         self.config = self.load_config()
         
     def load_config(self):
@@ -300,14 +433,23 @@ class AudioProcessor:
             
             # Save transcript to file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"Transcripts/transcript_{timestamp}.txt"
+            
+            # Use APP_BASE_DIR if available
+            if APP_BASE_DIR:
+                transcript_dir = os.path.join(APP_BASE_DIR, "Transcripts")
+                if not os.path.exists(transcript_dir):
+                    os.makedirs(transcript_dir)
+                filename = os.path.join(transcript_dir, f"transcript_{timestamp}.txt")
+            else:
+                filename = f"Transcripts/transcript_{timestamp}.txt"
+                
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(transcript_text)
             
             # Store transcript for later use
             self.transcript = transcript_text
             
-            self.update_status("Transcription complete.", percent=1.0)
+            self.update_status(f"Transcription complete. Saved to {filename}", percent=1.0)
             return transcript_text
             
         except openai.AuthenticationError:
@@ -358,8 +500,12 @@ class AudioProcessor:
         file_stats = os.stat(audio_file_path)
         file_hash = hashlib.md5(f"{audio_file_path}_{file_stats.st_mtime}".encode()).hexdigest()
         
-        # Check if cache directory exists
-        cache_dir = "diarization_cache"
+        # Use APP_BASE_DIR if available
+        if APP_BASE_DIR:
+            cache_dir = os.path.join(APP_BASE_DIR, "diarization_cache")
+        else:
+            cache_dir = "diarization_cache"
+            
         if not os.path.exists(cache_dir):
             os.makedirs(cache_dir)
             
@@ -391,8 +537,12 @@ class AudioProcessor:
             file_stats = os.stat(audio_file_path)
             file_hash = hashlib.md5(f"{audio_file_path}_{file_stats.st_mtime}".encode()).hexdigest()
             
-            # Check if cache directory exists
-            cache_dir = "diarization_cache"
+            # Use APP_BASE_DIR if available
+            if APP_BASE_DIR:
+                cache_dir = os.path.join(APP_BASE_DIR, "diarization_cache")
+            else:
+                cache_dir = "diarization_cache"
+                
             if not os.path.exists(cache_dir):
                 os.makedirs(cache_dir)
                 
@@ -451,7 +601,12 @@ class AudioProcessor:
             
             # If not found, check for a token file as a fallback
             if not token:
-                token_file = "pyannote_token.txt"
+                # Use APP_BASE_DIR if available
+                if APP_BASE_DIR:
+                    token_file = os.path.join(APP_BASE_DIR, "pyannote_token.txt")
+                else:
+                    token_file = "pyannote_token.txt"
+                
                 if os.path.exists(token_file):
                     with open(token_file, "r") as f:
                         file_token = f.read().strip()
@@ -687,7 +842,11 @@ class AudioProcessor:
             timeline_segments = []
             
             # Use diarization_cache directory for temporary storage if needed
-            cache_dir = "diarization_cache"
+            if APP_BASE_DIR:
+                cache_dir = os.path.join(APP_BASE_DIR, "diarization_cache")
+            else:
+                cache_dir = "diarization_cache"
+                
             if not os.path.exists(cache_dir):
                 os.makedirs(cache_dir)
                 
@@ -1508,7 +1667,17 @@ class LLMProcessor:
             summary = response.choices[0].message.content
             
             # Save summary to file
-            summary_filename = f"Summaries/summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Use APP_BASE_DIR if available
+            if APP_BASE_DIR:
+                summary_dir = os.path.join(APP_BASE_DIR, "Summaries")
+                if not os.path.exists(summary_dir):
+                    os.makedirs(summary_dir)
+                summary_filename = os.path.join(summary_dir, f"summary_{timestamp}.txt")
+            else:
+                summary_filename = f"Summaries/summary_{timestamp}.txt"
+                
             with open(summary_filename, 'w', encoding='utf-8') as f:
                 f.write(summary)
                 
@@ -1542,9 +1711,6 @@ class MainFrame(wx.Frame):
         
         # Center the window
         self.Centre()
-        
-        # Create required directories
-        ensure_directories()
         
         # Status update
         self.update_status("Application ready.", percent=0)
@@ -2801,16 +2967,88 @@ Troubleshooting:
 
 # Main Application Class
 class AudioApp(wx.App):
+    def __init__(self):
+        # Always force redirect=False to avoid screen check issues
+        super().__init__(redirect=False)
+    
     def OnInit(self):
-        frame = MainFrame(None, app_name)
-        frame.Show()
-        return True
+        try:
+            frame = MainFrame(None, app_name)
+            frame.Show()
+            return True
+        except Exception as e:
+            import traceback
+            error_msg = traceback.format_exc()
+            
+            # Show error dialog and log to console
+            wx.MessageBox(f"Error initializing application:\n\n{error_msg}", 
+                         "Application Error", wx.OK | wx.ICON_ERROR)
+            print(f"ERROR: {error_msg}")
+            return False
 
 # Main function
 if __name__ == "__main__":
-    # Ensure required directories exist
-    ensure_directories()
-    
-    # Create and start the application
-    app = AudioApp()
-    app.MainLoop()
+    try:
+        print("Starting Audio Processing App...")
+        
+        # Ensure required directories exist and get base directory
+        # Critical step: this must succeed before proceeding
+        try:
+            APP_BASE_DIR = ensure_directories()
+            print(f"Using application directory: {APP_BASE_DIR}")
+            
+            # Verify directories are created and writable
+            for subdir in ["Transcripts", "Summaries", "diarization_cache"]:
+                test_dir = os.path.join(APP_BASE_DIR, subdir)
+                if not os.path.exists(test_dir):
+                    os.makedirs(test_dir, exist_ok=True)
+                
+                # Verify we can write to the directory
+                test_file = os.path.join(test_dir, ".write_test")
+                try:
+                    with open(test_file, 'w') as f:
+                        f.write("test")
+                    if os.path.exists(test_file):
+                        os.remove(test_file)
+                    print(f"Directory {test_dir} is writable")
+                except Exception as e:
+                    print(f"WARNING: Directory {test_dir} is not writable: {e}")
+                    # Try to find an alternative location
+                    APP_BASE_DIR = os.path.join(os.path.expanduser("~"), "AudioProcessingApp")
+                    os.makedirs(APP_BASE_DIR, exist_ok=True)
+                    print(f"Using alternative directory: {APP_BASE_DIR}")
+                    break
+        except Exception as e:
+            import traceback
+            error_msg = traceback.format_exc()
+            print(f"FATAL ERROR setting up directories: {error_msg}")
+            
+            # Use a simple directory in the user's home folder as a last resort
+            APP_BASE_DIR = os.path.join(os.path.expanduser("~"), "AudioProcessingApp")
+            os.makedirs(APP_BASE_DIR, exist_ok=True)
+            print(f"Using fallback directory: {APP_BASE_DIR}")
+        
+        # Short delay to ensure filesystem operations complete
+        import time
+        time.sleep(0.5)
+        
+        # Create and start the application
+        app = AudioApp()
+        app.MainLoop()
+    except Exception as e:
+        import traceback
+        error_msg = traceback.format_exc()
+        print(f"FATAL ERROR: {error_msg}")
+        
+        # Try to show error dialog if possible
+        try:
+            import wx
+            if not hasattr(wx, 'App') or not wx.GetApp():
+                error_app = wx.App(False)
+            wx.MessageBox(f"Fatal error starting application:\n\n{error_msg}", 
+                         "Application Error", wx.OK | wx.ICON_ERROR)
+        except:
+            # If we can't even show a dialog, just exit
+            pass
+        
+        sys.exit(1)
