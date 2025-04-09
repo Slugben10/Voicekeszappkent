@@ -31,8 +31,45 @@ if platform.system() == 'darwin':
     # Set the exception handler
     sys.excepthook = handle_exception
 
-    # Try to patch wxPython directly
+    # Try to patch wxPython directly - ENHANCED METHOD
     try:
+        # First, patch Python's import mechanism to intercept wx imports
+        import builtins
+        original_import = builtins.__import__
+        
+        def patched_import(name, *args, **kwargs):
+            module = original_import(name, *args, **kwargs)
+            
+            # Intercept and patch wx core when it's imported
+            if name == 'wx' or name.startswith('wx.'):
+                # Patch _core if it exists
+                if hasattr(module, '_core'):
+                    # Override the screen check function
+                    if hasattr(module._core, '_macIsRunningOnMainDisplay'):
+                        module._core._macIsRunningOnMainDisplay = lambda: True
+                        print("Successfully patched _macIsRunningOnMainDisplay")
+                
+                # Also patch App class if it exists
+                if name == 'wx' and hasattr(module, 'App'):
+                    # Store original init
+                    original_init = module.App.__init__
+                    
+                    # Create patched init
+                    def patched_init(self, *args, **kwargs):
+                        # Force redirect to False
+                        kwargs['redirect'] = False
+                        return original_init(self, *args, **kwargs)
+                    
+                    # Apply patch
+                    module.App.__init__ = patched_init
+                    print("Successfully patched wx.App.__init__")
+            
+            return module
+        
+        # Replace the built-in import function with our patched version
+        builtins.__import__ = patched_import
+        
+        # Now also patch wx if it's already imported
         import wx
         
         # Patch wx.App to avoid screen check
@@ -45,15 +82,50 @@ if platform.system() == 'darwin':
                 return original_init(self, *args, **kwargs)
             
             wx.App.__init__ = patched_init
+            print("Patched wx.App.__init__")
         
         # Try to patch _core directly
         if hasattr(wx, '_core'):
             if hasattr(wx._core, '_macIsRunningOnMainDisplay'):
                 # Replace with function that always returns True
                 wx._core._macIsRunningOnMainDisplay = lambda: True
+                print("Patched wx._core._macIsRunningOnMainDisplay")
+                
+        # Directly monkey patch the main macOS screen check machinery
+        # This is the most aggressive approach
+        sys.modules['wx._core._macIsRunningOnMainDisplay'] = lambda: True
+        
     except Exception as e:
         # Not a fatal error, just log it
         print(f"Warning: Could not patch wxPython components: {e}")
+
+# Also modify wx.App class to completely bypass the screen check
+try:
+    import wx
+    # Create a backup of the original wx.App class
+    if hasattr(wx, 'App'):
+        OriginalApp = wx.App
+        
+        # Create a new App class that completely bypasses all screen checks
+        class ScreenCheckBypassApp(OriginalApp):
+            def __init__(self, *args, **kwargs):
+                # Always force redirect to False
+                kwargs['redirect'] = False
+                
+                # Call original init but catch any screen-check related errors
+                try:
+                    super().__init__(*args, **kwargs)
+                except Exception as e:
+                    print(f"Bypassing wx.App init error: {e}")
+                    # If init fails, try to initialize essential parts manually
+                    if hasattr(self, '_BootstrapApp'):
+                        self._BootstrapApp()
+        
+        # Replace the App class
+        wx.App = ScreenCheckBypassApp
+        print("Replaced wx.App with ScreenCheckBypassApp")
+except Exception as e:
+    print(f"Failed to replace wx.App class: {e}")
 
 import os
 import sys
@@ -326,7 +398,15 @@ class AudioProcessor:
             
     def convert_to_wav(self, file_path):
         """Convert audio file to WAV format for processing with PyAnnote."""
-        output_path = os.path.splitext(file_path)[0] + "_converted.wav"
+        # Create output path
+        filename = os.path.basename(file_path)
+        base_name = os.path.splitext(filename)[0]
+        
+        # Use APP_BASE_DIR if available
+        if APP_BASE_DIR:
+            output_path = os.path.join(APP_BASE_DIR, f"{base_name}_converted.wav")
+        else:
+            output_path = f"{base_name}_converted.wav"
         
         self.update_status(f"Converting {os.path.basename(file_path)} to WAV format...", percent=0.1)
         
@@ -341,16 +421,27 @@ class AudioProcessor:
                 # Fallback to FFmpeg if pydub fails
                 self.update_status("Pydub requires FFmpeg to be installed. Trying direct FFmpeg...", percent=0.2)
         
-        # Direct FFmpeg conversion
+        # First check if we have a bundled FFmpeg
+        ffmpeg_cmd = "ffmpeg"  # default command
+        bundled_ffmpeg = os.environ.get('BUNDLED_FFMPEG_PATH', '')
+        if bundled_ffmpeg and os.path.exists(bundled_ffmpeg):
+            ffmpeg_cmd = bundled_ffmpeg
+        elif sys.platform == 'darwin':
+            # Otherwise, try to get full path on macOS if possible
+            homebrew_ffmpeg = "/opt/homebrew/bin/ffmpeg"
+            if os.path.exists(homebrew_ffmpeg):
+                ffmpeg_cmd = homebrew_ffmpeg
+        
+        # Check if ffmpeg is available
         if not self._is_ffmpeg_available():
             install_instructions = self._get_ffmpeg_install_instructions()
             raise ValueError(f"FFmpeg is required for audio conversion but not found. Please install it.\n\n{install_instructions}")
         
         # Proceed with FFmpeg conversion
-        self.update_status("Converting with FFmpeg...", percent=0.5)
+        self.update_status(f"Converting with FFmpeg ({ffmpeg_cmd})...", percent=0.5)
         try:
             subprocess.run([
-                'ffmpeg', '-y', '-i', file_path, 
+                ffmpeg_cmd, '-y', '-i', file_path, 
                 '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
                 output_path
             ], check=True, stderr=subprocess.PIPE)
@@ -463,16 +554,47 @@ class AudioProcessor:
             
     def _is_ffmpeg_available(self):
         """Check if ffmpeg is available on the system."""
-        try:
-            subprocess.run(
-                ["ffmpeg", "-version"], 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE,
-                check=True
-            )
-            return True
-        except (subprocess.SubprocessError, FileNotFoundError):
-            return False
+        # First, try to use the bundled FFmpeg if available
+        bundled_ffmpeg = os.environ.get('BUNDLED_FFMPEG_PATH', '')
+        if bundled_ffmpeg and os.path.exists(bundled_ffmpeg):
+            try:
+                print(f"Checking bundled FFmpeg: {bundled_ffmpeg}")
+                result = subprocess.run(
+                    [bundled_ffmpeg, "-version"], 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
+                print(f"Bundled FFmpeg check successful!")
+                return True
+            except (subprocess.SubprocessError, FileNotFoundError) as e:
+                print(f"Bundled FFmpeg check failed: {e}")
+                # Fall back to system FFmpeg if bundled version fails
+        
+        # Try both with command name and full path
+        ffmpeg_paths = ["ffmpeg"]
+        
+        # On macOS, also try the Homebrew path
+        if sys.platform == 'darwin':
+            ffmpeg_paths.append("/opt/homebrew/bin/ffmpeg")
+        
+        for cmd in ffmpeg_paths:
+            try:
+                print(f"Checking FFmpeg with command: {cmd}")
+                result = subprocess.run(
+                    [cmd, "-version"], 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
+                print(f"FFmpeg found with command: {cmd}")
+                return True
+            except (subprocess.SubprocessError, FileNotFoundError) as e:
+                print(f"FFmpeg check failed with command {cmd}: {type(e).__name__}: {str(e)}")
+                # Continue to the next path if this one fails
+        
+        # If we've tried all paths and none worked, return False
+        return False
             
     def identify_speakers(self, transcript):
         """Use optimized methods to identify different speakers in the transcript."""
@@ -1124,8 +1246,22 @@ class AudioProcessor:
                 # -threads 2: Use 2 threads per extraction process
                 # -ac 1: Convert to mono
                 # -ar 16000: Use 16kHz sample rate (sufficient for voice)
+                
+                # Find ffmpeg command - try to get full path if possible
+                ffmpeg_cmd = "ffmpeg"  # default command
+                
+                # First check if we have a bundled FFmpeg
+                bundled_ffmpeg = os.environ.get('BUNDLED_FFMPEG_PATH', '')
+                if bundled_ffmpeg and os.path.exists(bundled_ffmpeg):
+                    ffmpeg_cmd = bundled_ffmpeg
+                elif sys.platform == 'darwin':
+                    # Otherwise, try to get full path on macOS if possible
+                    homebrew_ffmpeg = "/opt/homebrew/bin/ffmpeg"
+                    if os.path.exists(homebrew_ffmpeg):
+                        ffmpeg_cmd = homebrew_ffmpeg
+                
                 subprocess.run([
-                    'ffmpeg', '-y', '-loglevel', 'error', '-threads', '2',
+                    ffmpeg_cmd, '-y', '-loglevel', 'error', '-threads', '2',
                     '-i', audio_file,
                     '-ss', str(start_time),
                     '-to', str(end_time),
@@ -2825,16 +2961,47 @@ class MainFrame(wx.Frame):
 
     def _is_ffmpeg_available(self):
         """Check if ffmpeg is available on the system."""
-        try:
-            subprocess.run(
-                ["ffmpeg", "-version"], 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE,
-                check=True
-            )
-            return True
-        except (subprocess.SubprocessError, FileNotFoundError):
-            return False
+        # First, try to use the bundled FFmpeg if available
+        bundled_ffmpeg = os.environ.get('BUNDLED_FFMPEG_PATH', '')
+        if bundled_ffmpeg and os.path.exists(bundled_ffmpeg):
+            try:
+                print(f"Checking bundled FFmpeg: {bundled_ffmpeg}")
+                result = subprocess.run(
+                    [bundled_ffmpeg, "-version"], 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
+                print(f"Bundled FFmpeg check successful!")
+                return True
+            except (subprocess.SubprocessError, FileNotFoundError) as e:
+                print(f"Bundled FFmpeg check failed: {e}")
+                # Fall back to system FFmpeg if bundled version fails
+        
+        # Try both with command name and full path
+        ffmpeg_paths = ["ffmpeg"]
+        
+        # On macOS, also try the Homebrew path
+        if sys.platform == 'darwin':
+            ffmpeg_paths.append("/opt/homebrew/bin/ffmpeg")
+        
+        for cmd in ffmpeg_paths:
+            try:
+                print(f"Checking FFmpeg with command: {cmd}")
+                result = subprocess.run(
+                    [cmd, "-version"], 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
+                print(f"FFmpeg found with command: {cmd}")
+                return True
+            except (subprocess.SubprocessError, FileNotFoundError) as e:
+                print(f"FFmpeg check failed with command {cmd}: {type(e).__name__}: {str(e)}")
+                # Continue to the next path if this one fails
+        
+        # If we've tried all paths and none worked, return False
+        return False
 
     def check_pyannote(self):
         """Check if PyAnnote is available and show installation instructions if not."""
@@ -2963,18 +3130,34 @@ Troubleshooting:
         """Save the PyAnnote token."""
         token = self.pyannote_token_input.GetValue()
         self.config_manager.set_pyannote_token(token)
+        
+        # Update the speaker identification button style
+        self.identify_speakers_btn.SetLabel(self.get_speaker_id_button_label())
+        self.speaker_id_help_text.SetLabel(self.get_speaker_id_help_text())
+        self.update_speaker_id_button_style()
+        self.audio_panel.Layout()
+        
         wx.MessageBox("PyAnnote token saved successfully.", "Success", wx.OK | wx.ICON_INFORMATION)
 
 # Main Application Class
 class AudioApp(wx.App):
     def __init__(self):
         # Always force redirect=False to avoid screen check issues
-        super().__init__(redirect=False)
+        # Don't call super().__init__ to avoid potential crashes
+        # Instead, initialize wx.App with minimal parameters
+        wx.App.__init__(self, redirect=False)
+        
+        # Explicitly patch any remaining screen check functions
+        if platform.system() == 'darwin':
+            if hasattr(wx, '_core') and hasattr(wx._core, '_macIsRunningOnMainDisplay'):
+                wx._core._macIsRunningOnMainDisplay = lambda: True
+                print("Final patch of screen check in AudioApp")
     
     def OnInit(self):
         try:
             frame = MainFrame(None, app_name)
             frame.Show()
+            self.SetTopWindow(frame)
             return True
         except Exception as e:
             import traceback
@@ -2990,6 +3173,52 @@ class AudioApp(wx.App):
 if __name__ == "__main__":
     try:
         print("Starting Audio Processing App...")
+        
+        # FINAL BYPASS: Direct monkey patching of the wxPython screen check
+        if platform.system() == 'darwin':
+            # Set additional environment variables that might help
+            os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
+            os.environ['WX_NO_DISPLAY_CHECK'] = '1'
+            os.environ['PYTHONFRAMEWORK'] = '1'
+            
+            # Direct monkey patching of the wx modules
+            import sys
+            # Create a dummy function that always returns True
+            def always_return_true(*args, **kwargs):
+                return True
+                
+            # Try to intercept any possible wxPython screen check
+            for module_name in list(sys.modules.keys()):
+                if module_name.startswith('wx'):
+                    module = sys.modules[module_name]
+                    # Try to patch any _macIsRunningOnMainDisplay function
+                    if hasattr(module, '_macIsRunningOnMainDisplay'):
+                        setattr(module, '_macIsRunningOnMainDisplay', always_return_true)
+                    # Or look deeper if the module has _core
+                    if hasattr(module, '_core') and hasattr(module._core, '_macIsRunningOnMainDisplay'):
+                        module._core._macIsRunningOnMainDisplay = always_return_true
+            
+            # Create fake modules to prevent errors
+            class FakeModule:
+                @staticmethod
+                def _macIsRunningOnMainDisplay(*args, **kwargs):
+                    return True
+                    
+            # Insert fake modules
+            sys.modules['wx._core._macIsRunningOnMainDisplay'] = always_return_true
+            
+            print("Applied final wx screen check bypass")
+            
+        # Add homebrew bin directory to PATH for FFmpeg on macOS
+        if sys.platform == 'darwin':
+            homebrew_paths = ["/opt/homebrew/bin", "/usr/local/bin"]
+            for path in homebrew_paths:
+                if path not in os.environ['PATH'].split(os.pathsep):
+                    os.environ['PATH'] = path + os.pathsep + os.environ['PATH']
+                    print(f"Added {path} to PATH")
+        
+        # Print debug info
+        print(f"PATH environment: {os.environ.get('PATH', 'PATH not found')}")
         
         # Ensure required directories exist and get base directory
         # Critical step: this must succeed before proceeding
