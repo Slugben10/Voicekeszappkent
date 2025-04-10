@@ -846,11 +846,14 @@ except Exception as e:
         "--runtime-hook", wx_path_file,
         # Add data files
         "--add-data", f"{wx_path_file}:.",
-        # Exclude problematic libraries
-        "--exclude-module", "torch",
-        "--exclude-module", "torchvision",
-        "--exclude-module", "torchaudio",
     ]
+    
+    # Add token file if it exists
+    token_file = "pyannote_token.txt"
+    if os.path.exists(token_file):
+        sep = ";" if platform.system() == "Windows" else ":"
+        cmd.extend(["--add-data", f"{token_file}{sep}."])
+        print("Adding PyAnnote token file to the build")
     
     # Add icon if exists
     icon_path = get_icon_path()

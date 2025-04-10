@@ -1,0 +1,63 @@
+Matplotlib is building the font cache; this may take a moment.
+urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+Traceback (most recent call last):
+  File "main.py", line 288, in <module>
+    try:
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "pyannote/audio/__init__.py", line 29, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "pyannote/audio/core/inference.py", line 33, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "pytorch_lightning/__init__.py", line 25, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "lightning_fabric/__init__.py", line 14, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "lightning_fabric/__version__.py", line 8, in <module>
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/binobenjamin/Documents/Audio/dist/Audio Processing App.app/Contents/Frameworks/lightning_fabric/version.info'
+[PYI-23518:ERROR] Failed to execute script 'main' due to unhandled exception: [Errno 2] No such file or directory: '/Users/binobenjamin/Documents/Audio/dist/Audio Processing App.app/Contents/Frameworks/lightning_fabric/version.info'
+[PYI-23518:ERROR] Traceback:
+Traceback (most recent call last):
+  File "main.py", line 288, in <module>
+    try:
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "pyannote/audio/__init__.py", line 29, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "pyannote/audio/core/inference.py", line 33, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "pytorch_lightning/__init__.py", line 25, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "lightning_fabric/__init__.py", line 14, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "lightning_fabric/__version__.py", line 8, in <module>
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/binobenjamin/Documents/Audio/dist/Audio Processing App.app/Contents/Frameworks/lightning_fabric/version.info'
+

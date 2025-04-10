@@ -1,2 +1,1 @@
-# Get your token from https://huggingface.co/pyannote/speaker-diarization
-# Then replace this text with your token
+hf_dummy_token

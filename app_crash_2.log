@@ -1,0 +1,87 @@
+Matplotlib is building the font cache; this may take a moment.
+urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+Traceback (most recent call last):
+  File "main.py", line 289, in <module>
+    with open(self.config_file, 'r') as f:
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "pyannote/audio/pipelines/__init__.py", line 26, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "pyannote/audio/pipelines/speaker_diarization.py", line 42, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "pyannote/audio/pipelines/speaker_verification.py", line 43, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "speechbrain/__init__.py", line 6, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "speechbrain/core.py", line 39, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "speechbrain/dataio/__init__.py", line 4, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "speechbrain/utils/__init__.py", line 6, in <module>
+  File "speechbrain/utils/importutils.py", line 265, in lazy_export_all
+  File "speechbrain/utils/importutils.py", line 206, in find_imports
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/binobenjamin/Documents/Audio/dist/Audio Processing App.app/Contents/Frameworks/speechbrain/utils'
+[PYI-23813:ERROR] Failed to execute script 'main' due to unhandled exception: [Errno 2] No such file or directory: '/Users/binobenjamin/Documents/Audio/dist/Audio Processing App.app/Contents/Frameworks/speechbrain/utils'
+[PYI-23813:ERROR] Traceback:
+Traceback (most recent call last):
+  File "main.py", line 289, in <module>
+    with open(self.config_file, 'r') as f:
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "pyannote/audio/pipelines/__init__.py", line 26, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "pyannote/audio/pipelines/speaker_diarization.py", line 42, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "pyannote/audio/pipelines/speaker_verification.py", line 43, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "speechbrain/__init__.py", line 6, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "speechbrain/core.py", line 39, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "speechbrain/dataio/__init__.py", line 4, in <module>
+  File "<frozen importlib._bootstrap>", line 1007, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 986, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 680, in _load_unlocked
+  File "PyInstaller/loader/pyimod02_importers.py", line 450, in exec_module
+  File "speechbrain/utils/__init__.py", line 6, in <module>
+  File "speechbrain/utils/importutils.py", line 265, in lazy_export_all
+  File "speechbrain/utils/importutils.py", line 206, in find_imports
+FileNotFoundError: [Errno 2] No such file or directory: '/Users/binobenjamin/Documents/Audio/dist/Audio Processing App.app/Contents/Frameworks/speechbrain/utils'
+

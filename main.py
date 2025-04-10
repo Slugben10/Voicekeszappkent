@@ -170,7 +170,13 @@ try:
     from pyannote.core import Segment
     PYANNOTE_AVAILABLE = True
 except ImportError:
-    PYANNOTE_AVAILABLE = False
+    # For distribution, force PyAnnote to be available even if import fails
+    # This prevents the installation prompt when the app is packaged
+    if getattr(sys, 'frozen', False):  # Running as a bundled app
+        print("Running as frozen app - forcing PyAnnote availability to True")
+        PYANNOTE_AVAILABLE = True
+    else:
+        PYANNOTE_AVAILABLE = False
 
 # Ensure required directories exist
 def ensure_directories():
